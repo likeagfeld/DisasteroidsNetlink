@@ -598,8 +598,8 @@ static void drawPauseScore(void)
         drawLetter(digit1, color, xPos + (letterSpacing*1), yPos, xScale, yScale);
         drawLetter(digit2, color, xPos + (letterSpacing*2), yPos, xScale, yScale);
 
-        // player ship
-        mesh = g_Assets.ships[i];
+        // player ship — use playerID as mesh index, not rank position
+        mesh = g_Assets.ships[player->playerID % MAX_PLAYERS];
 
         xPos = online ? COL_ON_SHIP : COL_OFF_SHIP;
 
@@ -618,12 +618,12 @@ static void drawPauseScore(void)
 
         drawPauseScoreShip(mesh, xPos, yPos, shipColor);
 
-        // name (online only)
+        // name (online only) — drawn in player's ship color for clear association
         if (online)
         {
             const char* name = getOnlinePlayerName(player->playerID);
             xPos = COL_ON_NAME;
-            drawString(name, 8, color, xPos, yPos, xScale, yScale, letterSpacing);
+            drawString(name, 8, shipColor, xPos, yPos, xScale, yScale, letterSpacing);
         }
 
         // lives

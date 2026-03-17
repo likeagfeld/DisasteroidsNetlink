@@ -1421,6 +1421,19 @@ class DisasteroidsServer:
             for lp_id in c.local_player_ids:
                 c.send_raw(build_local_player_ack(lp_id))
 
+        # Send PLAYER_JOIN roster so clients know game_player_id -> name
+        roster = []
+        for c in ready_players:
+            roster.append((c.game_player_id, c.username))
+        for c in ready_players:
+            for i, ln in enumerate(c.local_player_names):
+                roster.append((c.local_player_ids[i], ln))
+        for bot in ready_bots:
+            roster.append((bot.game_player_id, bot.name))
+        for c in ready_players:
+            for pid, name in roster:
+                c.send_raw(build_player_join(pid, name))
+
         # Start first wave after a short delay for clients to init
         self._start_new_wave()
 
@@ -1554,10 +1567,11 @@ class DisasteroidsServer:
         if kill_evt:
             self._broadcast_event(kill_evt)
 
-        # Destroy the asteroid (if still alive)
-        destroy_evt = self.sim._destroy_asteroid(slot, 0xFF)
-        if destroy_evt:
-            self._broadcast_event(destroy_evt)
+        # Destroy the asteroid (if still alive); slot 0xFF = projectile kill, no asteroid
+        if slot != 0xFF:
+            destroy_evt = self.sim._destroy_asteroid(slot, 0xFF)
+            if destroy_evt:
+                self._broadcast_event(destroy_evt)
 
         # Check game over
         go_evt = self.sim._check_game_over()

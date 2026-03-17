@@ -331,7 +331,24 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
         return;
     }
 
-    // check if any of the Disasteroids collided with any of the projectiles
+    if(player->respawnFrames > 0)
+    {
+        // player is respawning, skip
+        return;
+    }
+
+    // In online mode, only check collision for local players.
+    // Remote player collisions would consume projectiles incorrectly.
+    if(g_Game.isOnlineMode)
+    {
+        bool isLocal = ((unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID);
+        if(g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2)
+            isLocal = true;
+        if(!isLocal)
+            return;
+    }
+
+    // check if any of the projectiles collided with this player
     for(unsigned int k = 0; k < COUNTOF(g_Projectiles); k++)
     {
         projectile = &g_Projectiles[k];
@@ -354,21 +371,22 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
             if(g_Game.gameType == GAME_TYPE_COOP)
             {
                 // in coop bounce the player around
-                // (skip velocity push for remote players in online — server owns their physics)
-                if(!g_Game.isOnlineMode || (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID
-                   || (g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2))
-                {
-                    player->curPos.dx += projectile->curPos.dx;
-                    player->curPos.dy += projectile->curPos.dy;
-                }
+                player->curPos.dx += projectile->curPos.dx;
+                player->curPos.dy += projectile->curPos.dy;
             }
             else
             {
-                // in versus kill the player (cosmetic in online — server handles actual death)
-                destroyPlayer(player);
-                // Only score locally in offline — server is authoritative online
-                if(!g_Game.isOnlineMode)
+                if(g_Game.isOnlineMode)
                 {
+                    // Online versus: notify server, cosmetic death locally
+                    dnet_send_ship_asteroid_hit(0xFF, (uint8_t)player->playerID);
+                    destroyPlayer(player);  // cosmetic only
+                    player->respawnFrames = 60;  // hide while waiting for server
+                }
+                else
+                {
+                    // Offline versus: destroy directly
+                    destroyPlayer(player);
                     incrementScoreByPlayerID(projectile->playerID, PVP_DESTROY_POINTS);
                 }
             }

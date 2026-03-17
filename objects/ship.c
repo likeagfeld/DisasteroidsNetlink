@@ -308,12 +308,16 @@ void destroyPlayerFromServer(int player_id, int lives, int angle,
     if(player_id < 0 || player_id >= MAX_PLAYERS) return;
     player = &g_Players[player_id];
 
-    // cosmetic effects
-    jo_audio_play_sound(&g_Assets.popPCM);
-    spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
-    spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
-    spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
-    spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+    // Only play cosmetic effects if not already handled locally.
+    // Local collision handler sets respawnFrames > 0 and plays effects.
+    if(player->respawnFrames <= 0)
+    {
+        jo_audio_play_sound(&g_Assets.popPCM);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+    }
 
     player->numLives = lives;
 

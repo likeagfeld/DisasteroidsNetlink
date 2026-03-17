@@ -252,6 +252,10 @@ static void process_game_start(const uint8_t* payload, int len)
     memset(g_net.remote_inputs, 0, sizeof(g_net.remote_inputs));
     memset(g_net.remote_input_head, 0, sizeof(g_net.remote_input_head));
 
+    /* Clear lobby roster — server will resend via PLAYER_JOIN with game IDs */
+    memset(g_net.lobby_players, 0, sizeof(g_net.lobby_players));
+    g_net.lobby_count = 0;
+
     dnet_log("Game starting!");
 }
 
@@ -593,8 +597,44 @@ static void process_message(const uint8_t* payload, int len)
         break;
 
     case DNET_MSG_PLAYER_JOIN:
-        dnet_log("Player joined!");
+    {
+        /* [player_id:1][name:LP] — store game_player_id → name mapping */
+        if (len >= 2) {
+            uint8_t pid = payload[1];
+            int slot;
+            /* Find existing slot or first inactive slot */
+            int target = -1;
+            for (slot = 0; slot < DNET_MAX_PLAYERS; slot++) {
+                if (g_net.lobby_players[slot].active &&
+                    g_net.lobby_players[slot].id == pid) {
+                    target = slot;
+                    break;
+                }
+            }
+            if (target < 0) {
+                for (slot = 0; slot < DNET_MAX_PLAYERS; slot++) {
+                    if (!g_net.lobby_players[slot].active) {
+                        target = slot;
+                        break;
+                    }
+                }
+            }
+            if (target >= 0) {
+                g_net.lobby_players[target].id = pid;
+                g_net.lobby_players[target].active = true;
+                if (len >= 3) {
+                    dnet_read_string(&payload[2], len - 2,
+                                     g_net.lobby_players[target].name,
+                                     DNET_MAX_NAME + 1);
+                }
+                if (target >= g_net.lobby_count)
+                    g_net.lobby_count = target + 1;
+            }
+        }
+        if (g_net.state == DNET_STATE_LOBBY)
+            dnet_log("Player joined!");
         break;
+    }
 
     case DNET_MSG_PLAYER_LEAVE:
         dnet_log("Player left!");

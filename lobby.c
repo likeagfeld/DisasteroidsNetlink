@@ -197,7 +197,7 @@ void lobby_draw(void)
         const char* name = nd->lobby_players[i].name;
         const char* ready_str = nd->lobby_players[i].ready ? "READY" : "---";
 
-        jo_printf(3, row, "%-16s %s", name, ready_str);
+        jo_printf(3, row, "%-16s %-5s", name, ready_str);
     }
 
     /* Clear remaining rows if fewer players than last draw */
