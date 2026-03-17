@@ -20,6 +20,7 @@ typedef enum _MENU_OPTIONS
     TITLE_OPTION_GAME_LIVES = 1,
     TITLE_OPTION_GAME_HUD = 2,
     TITLE_OPTION_GAME_START = 3,
+    TITLE_OPTION_ONLINE = 4,
     TITLE_OPTION_MAX,
 } MENU_OPTIONS;
 
@@ -181,7 +182,20 @@ void titleScreen_input(void)
                         // enough players, fall through to game start
                     }
 
+                    g_Game.isOnlineMode = false;
                     transitionState(GAME_STATE_GAMEPLAY);
+                    break;
+                }
+                case TITLE_OPTION_ONLINE:
+                {
+                    if(jo_is_pad1_key_pressed(JO_KEY_RIGHT) ||
+                       jo_is_pad1_key_pressed(JO_KEY_LEFT))
+                    {
+                        break;
+                    }
+
+                    g_Game.isOnlineMode = true;
+                    transitionState(GAME_STATE_CONNECTING);
                     break;
                 }
             }
@@ -414,6 +428,20 @@ static void drawOptions(void)
     drawLetter('R', color, xPos - letterSpacing * 1, yPos, xScale, yScale);
     drawLetter('T', color, xPos - letterSpacing * 0, yPos, xScale, yScale);
     drawLetter('!', color, xPos - letterSpacing * -1, yPos, xScale, yScale);
+
+    //
+    // ONLINE (NetLink)
+    //
+
+    xPos = 11;
+    yPos = 60;
+
+    drawLetter('O', color, xPos - letterSpacing * 4, yPos, xScale, yScale);
+    drawLetter('N', color, xPos - letterSpacing * 3, yPos, xScale, yScale);
+    drawLetter('L', color, xPos - letterSpacing * 2, yPos, xScale, yScale);
+    drawLetter('I', color, xPos - letterSpacing * 1, yPos, xScale, yScale);
+    drawLetter('N', color, xPos - letterSpacing * 0, yPos, xScale, yScale);
+    drawLetter('E', color, xPos - letterSpacing * -1, yPos, xScale, yScale);
 }
 
 // version text

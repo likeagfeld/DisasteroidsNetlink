@@ -10,9 +10,14 @@
 #include "objects/explosion.h"
 #include "objects/projectile.h"
 #include "objects/star.h"
+#include "net/disasteroids_net.h"
+#include "net/disasteroids_protocol.h"
 
 // players
 static void getGameplayPlayersInput(void);
+static uint16_t packLocalInput(int playerID);
+static void getOnlinePlayersInput(void);
+static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits);
 static void updateGameplayPlayers(void);
 
 // gameplay state
@@ -40,6 +45,8 @@ void gameplay_init(void)
     initStars();
     initAlien();
 
+    g_Game.netFrameCount = 0;
+
     initWave();
 }
 
@@ -56,7 +63,14 @@ void gameplay_input(void)
         return;
     }
 
-    getGameplayPlayersInput();
+    if(g_Game.isOnlineMode)
+    {
+        getOnlinePlayersInput();
+    }
+    else
+    {
+        getGameplayPlayersInput();
+    }
 }
 
 // gameplay update callback
@@ -245,6 +259,121 @@ static void getGameplayPlayersInput(void)
         else if(player->curPos.dy < MIN_SPEED_Y)
         {
             player->curPos.dy = MIN_SPEED_Y;
+        }
+    }
+}
+
+// pack local controller input into a bitmask for network transmission
+static uint16_t packLocalInput(int playerID)
+{
+    uint16_t bits = 0;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_UP))    bits |= DNET_INPUT_UP;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_DOWN))  bits |= DNET_INPUT_DOWN;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_LEFT))  bits |= DNET_INPUT_LEFT;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_RIGHT)) bits |= DNET_INPUT_RIGHT;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_A))     bits |= DNET_INPUT_A;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_B))     bits |= DNET_INPUT_B;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_C))     bits |= DNET_INPUT_C;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_X))     bits |= DNET_INPUT_X;
+    if (jo_is_input_key_pressed(playerID, JO_KEY_START)) bits |= DNET_INPUT_START;
+    return bits;
+}
+
+// apply a network input bitmask to a player (same logic as controller input)
+static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits)
+{
+    if(player->objectState != OBJECT_STATE_ACTIVE) return;
+    if(player->respawnFrames > 0) return;
+
+    // Color change
+    if (bits & DNET_INPUT_X) {
+        if(player->input.pressedX == false) {
+            pushPlayerColor(player->color);
+            player->color = popPlayerColor();
+        }
+        player->input.pressedX = true;
+    } else {
+        player->input.pressedX = false;
+    }
+
+    // Rotation
+    if (bits & DNET_INPUT_LEFT) {
+        if(player->input.pressedLeft == false) {
+            player->curPos.drot = -Z_SPEED_INC;
+        }
+    } else if (bits & DNET_INPUT_RIGHT) {
+        if(player->input.pressedRight == false) {
+            player->curPos.drot = Z_SPEED_INC;
+        }
+    } else {
+        player->curPos.drot = 0;
+    }
+
+    // Track left/right press state
+    player->input.pressedLeft = (bits & DNET_INPUT_LEFT) ? true : false;
+    player->input.pressedRight = (bits & DNET_INPUT_RIGHT) ? true : false;
+
+    if(player->invulnerabilityFrames > INVULNERABILITY_TIMER/2) return;
+
+    // Shooting
+    if ((bits & DNET_INPUT_A) || (bits & DNET_INPUT_C)) {
+        if(player->input.pressedAC == false) {
+            spawnProjectile(player);
+            player->input.pressedAC = true;
+        }
+    } else {
+        player->input.pressedAC = false;
+    }
+
+    // Thrusting
+    if ((bits & DNET_INPUT_UP) || (bits & DNET_INPUT_B)) {
+        player->curPos.dx += jo_fixed_sin(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
+        player->curPos.dy -= jo_fixed_cos(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
+        player->isThrusting = true;
+    } else {
+        player->curPos.dx -= jo_fixed_mult(FRICTION, player->curPos.dx);
+        player->curPos.dy -= jo_fixed_mult(FRICTION, player->curPos.dy);
+        player->isThrusting = false;
+    }
+
+    // Speed bounds
+    if(player->curPos.dx > MAX_SPEED_X) player->curPos.dx = MAX_SPEED_X;
+    else if(player->curPos.dx < MIN_SPEED_X) player->curPos.dx = MIN_SPEED_X;
+    if(player->curPos.dy > MAX_SPEED_Y) player->curPos.dy = MAX_SPEED_Y;
+    else if(player->curPos.dy < MIN_SPEED_Y) player->curPos.dy = MIN_SPEED_Y;
+}
+
+// online mode input: local player sends inputs, all others receive from network
+static void getOnlinePlayersInput(void)
+{
+    uint16_t local_bits;
+    int remote_bits;
+    uint16_t frame;
+    unsigned int i;
+    uint8_t my_id = g_Game.myPlayerID;
+
+    frame = (uint16_t)(g_Game.netFrameCount & 0xFFFF);
+    g_Game.netFrameCount++;
+
+    for(i = 0; i < COUNTOF(g_Players); i++)
+    {
+        if(g_Players[i].objectState != OBJECT_STATE_ACTIVE)
+            continue;
+
+        if(i == (unsigned int)my_id) {
+            // Local player: always read from controller port 0 (pad 1)
+            local_bits = packLocalInput(0);
+            applyInputBitsToPlayer(&g_Players[i], local_bits);
+            dnet_send_input_delta(frame, local_bits);
+        } else {
+            // Remote player: read from network buffer
+            remote_bits = dnet_get_remote_input(frame, (uint8_t)i);
+            if(remote_bits >= 0) {
+                applyInputBitsToPlayer(&g_Players[i], (uint16_t)remote_bits);
+            } else {
+                // No remote input yet — idle (no buttons)
+                applyInputBitsToPlayer(&g_Players[i], 0);
+            }
         }
     }
 }

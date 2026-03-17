@@ -7,6 +7,7 @@ static void loadSpecialCharacters(void);
 
 // capital letters
 static jo_3d_mesh* createA(void);
+static jo_3d_mesh* createB(void);
 static jo_3d_mesh* createC(void);
 static jo_3d_mesh* createD(void);
 static jo_3d_mesh* createE(void);
@@ -60,6 +61,7 @@ void loadFont(void)
 void loadAlphabet(void)
 {
     g_Assets.letters[LETTER_TO_INDEX('A')] = createA();
+    g_Assets.letters[LETTER_TO_INDEX('B')] = createB();
     g_Assets.letters[LETTER_TO_INDEX('C')] = createC();
     g_Assets.letters[LETTER_TO_INDEX('D')] = createD();
     g_Assets.letters[LETTER_TO_INDEX('E')] = createE();
@@ -121,6 +123,21 @@ static jo_3d_mesh* createA(void)
     QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
     QUAD_LINE_SEGMENT(mesh, 0, 4, 4, 4);
     QUAD_LINE_SEGMENT(mesh, 0, 2, 4, 2);
+
+    return mesh;
+}
+
+static jo_3d_mesh* createB(void)
+{
+    jo_3d_mesh* mesh = jo_3d_create_mesh(6);
+    int verticeIndex = 0;
+
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 4);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 3, 0);
+    QUAD_LINE_SEGMENT(mesh, 0, 4, 3, 4);
+    QUAD_LINE_SEGMENT(mesh, 0, 2, 4, 2);
+    QUAD_LINE_SEGMENT(mesh, 3, 0, 3, 2);
+    QUAD_LINE_SEGMENT(mesh, 3, 2, 3, 4);
 
     return mesh;
 }

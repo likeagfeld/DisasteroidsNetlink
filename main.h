@@ -7,7 +7,7 @@
 #include "gameplay_constants.h"
 #include "objects/player.h"
 
-#define GAME_VERSION "1.00"
+#define GAME_VERSION "1.10"
 #define MAX_DEBUG_LEVEL (1)
 
 // supported game types
@@ -67,6 +67,15 @@ typedef struct _GAME
     // hack to cache controller inputs
     // used for menus by player 1
     INPUTCACHE input;
+
+    // online multiplayer
+    bool isOnlineMode;
+
+    // which player index this Saturn controls (assigned by server)
+    unsigned char myPlayerID;
+
+    // frame counter for network input sync
+    unsigned int netFrameCount;
 
 } GAME, *PGAME;
 

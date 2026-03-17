@@ -4,6 +4,8 @@
 #include "gameplay.h"
 #include "ssmtf_logo.h"
 #include "title_screen.h"
+#include "connecting.h"
+#include "lobby.h"
 #include "assets/audio.h"
 
 // transistions between game states
@@ -27,8 +29,22 @@ void transitionState(GAME_STATE newState)
             {
                 playCDTrack(TITLE_TRACK);
             }
+            g_Game.isOnlineMode = false;
             titleScreen_init();
             g_Game.gameState = GAME_STATE_TITLE_SCREEN;
+            break;
+        }
+        case GAME_STATE_CONNECTING:
+        {
+            jo_audio_stop_cd();
+            connecting_init();
+            g_Game.gameState = GAME_STATE_CONNECTING;
+            break;
+        }
+        case GAME_STATE_LOBBY:
+        {
+            lobby_init();
+            g_Game.gameState = GAME_STATE_LOBBY;
             break;
         }
         case GAME_STATE_GAMEPLAY:

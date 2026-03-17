@@ -1,5 +1,6 @@
 /*
 **   Disasteroids - 12 player Asteroids clone by Slinga
+**   NetLink online multiplayer added using SNCP protocol
 */
 
 /*
@@ -37,10 +38,59 @@
 #include "title_screen.h"
 #include "gameplay.h"
 #include "pause.h"
+#include "connecting.h"
+#include "lobby.h"
+#include "net/disasteroids_net.h"
+#include "net/saturn_uart16550.h"
 
 GAME g_Game = {0};
 ASSETS g_Assets = {0};
 PLAYER g_Players[MAX_PLAYERS] = {0};
+
+/*============================================================================
+ * Saturn UART + Transport globals (used by connecting.c)
+ *============================================================================*/
+
+saturn_uart16550_t g_uart = {0};
+bool g_modem_detected = false;
+
+static bool saturn_transport_rx_ready(void* ctx)
+{
+    return saturn_uart_rx_ready((saturn_uart16550_t*)ctx);
+}
+
+static uint8_t saturn_transport_rx_byte(void* ctx)
+{
+    saturn_uart16550_t* u = (saturn_uart16550_t*)ctx;
+    return (uint8_t)saturn_uart_reg_read(u, SATURN_UART_RBR);
+}
+
+static int saturn_transport_send(void* ctx, const uint8_t* data, int len)
+{
+    saturn_uart16550_t* u = (saturn_uart16550_t*)ctx;
+    int i;
+    for (i = 0; i < len; i++) {
+        if (!saturn_uart_putc(u, data[i])) return i;
+    }
+    return len;
+}
+
+net_transport_t g_saturn_transport = {
+    saturn_transport_rx_ready,
+    saturn_transport_rx_byte,
+    saturn_transport_send,
+    (void*)0,  /* is_connected = NULL */
+    (void*)0,  /* ctx = set later to &g_uart */
+};
+
+/*============================================================================
+ * Network tick callback (runs every frame, all game states)
+ *============================================================================*/
+
+void network_tick(void)
+{
+    dnet_tick();
+}
 
 // global callbacks, not tied to a specific game state
 void abcStart_callback(void);
@@ -72,12 +122,23 @@ void jo_main(void)
     jo_core_add_callback(titleScreen_update);
     jo_core_add_callback(titleScreen_draw);
 
+    jo_core_add_callback(connecting_input);
+    jo_core_add_callback(connecting_update);
+    jo_core_add_callback(connecting_draw);
+
+    jo_core_add_callback(lobby_input);
+    jo_core_add_callback(lobby_update);
+    jo_core_add_callback(lobby_draw);
+
     jo_core_add_callback(gameplay_input);
     jo_core_add_callback(gameplay_update);
     jo_core_add_callback(gameplay_draw);
 
     jo_core_add_callback(pause_input);
     jo_core_add_callback(pause_draw);
+
+    // network tick runs every frame
+    jo_core_add_callback(network_tick);
 
     // misc callbacks
     jo_core_add_callback(changeHud_input);
@@ -96,6 +157,37 @@ void jo_main(void)
     jo_3d_camera_look_at(&g_Game.camera);
 
     g_Game.hudColor = JO_COLOR_Green;
+
+    //
+    // Initialize networking
+    //
+
+    dnet_init();
+
+    // Set up transport context
+    g_saturn_transport.ctx = &g_uart;
+
+    // Detect modem hardware (non-blocking, does NOT dial)
+    saturn_netlink_smpc_enable();
+    {
+        /* Try both known NetLink base addresses */
+        static const struct { uint32_t base; uint32_t stride; } addrs[] = {
+            { 0x25895001, 4 },
+            { 0x04895001, 4 },
+        };
+        int i;
+
+        g_modem_detected = false;
+        for (i = 0; i < 2; i++) {
+            g_uart.base = addrs[i].base;
+            g_uart.stride = addrs[i].stride;
+            if (saturn_uart_detect(&g_uart)) {
+                g_modem_detected = true;
+                break;
+            }
+        }
+    }
+    dnet_set_modem_available(g_modem_detected);
 
     // transition to first game state
     transitionState(GAME_STATE_SSMTF_LOGO);
@@ -116,6 +208,13 @@ void abcStart_callback(void)
     // don't do anything if already at the title screen
     if(g_Game.gameState != GAME_STATE_TITLE_SCREEN)
     {
+        // If online, send disconnect first
+        if(g_Game.isOnlineMode)
+        {
+            dnet_send_disconnect();
+            g_Game.isOnlineMode = false;
+        }
+
         g_Game.input.pressedStart = true;
         g_Game.input.pressedAC = true;
         g_Game.input.pressedB = true;

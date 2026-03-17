@@ -1,6 +1,7 @@
 #include <jo/jo.h>
 #include "../main.h"
 #include "../assets/alien.h"
+#include "../net/disasteroids_net.h"
 #include "alien.h"
 #include "explosion.h"
 
@@ -36,16 +37,36 @@ void initPlayers(void)
     {
         PPLAYER player = &g_Players[i];
         int color = player->color; // save existing player color
+        bool shouldActivate = false;
 
         // zero out the rest of the struct
         memset(player, 0, sizeof(PLAYER));
 
         player->playerID = i;
 
-        // activate the player if the controller port is connected
-        if (!jo_is_input_available(player->playerID))
+        if(g_Game.isOnlineMode)
         {
-            // controller not plugged in
+            // Online mode: activate players 0..opponent_count
+            // (opponent_count + 1 = total players including self)
+            {
+                const dnet_state_data_t* nd = dnet_get_data();
+                if(i <= (int)nd->opponent_count)
+                {
+                    shouldActivate = true;
+                }
+            }
+        }
+        else
+        {
+            // Local mode: activate the player if the controller port is connected
+            if (jo_is_input_available(player->playerID))
+            {
+                shouldActivate = true;
+            }
+        }
+
+        if(!shouldActivate)
+        {
             continue;
         }
 
