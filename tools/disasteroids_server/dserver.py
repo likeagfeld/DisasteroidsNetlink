@@ -450,10 +450,12 @@ class DisasteroidsServer:
                 client.user_id, client.uuid, client.username))
             self._broadcast_lobby_state()
         else:
-            # New player
-            client.uuid = str(uuid.uuid4())
-            client.user_id = self._next_user_id()
-            self.uuid_map[client.uuid] = ""
+            # New player — reuse UUID if this socket already got one
+            # (handles duplicate CONNECT on same connection)
+            if not client.uuid:
+                client.uuid = str(uuid.uuid4())
+                client.user_id = self._next_user_id()
+                self.uuid_map[client.uuid] = ""
             log.info("New player connected (uuid=%s..)", client.uuid[:8])
             client.send_raw(build_username_required())
 
@@ -473,6 +475,8 @@ class DisasteroidsServer:
         # Check for duplicate names
         for s, c in self.clients.items():
             if s != sock and c.authenticated and c.username.lower() == username.lower():
+                log.info("Username '%s' taken, rejected for user_id %d",
+                         username, client.user_id)
                 client.send_raw(build_username_taken())
                 return
 

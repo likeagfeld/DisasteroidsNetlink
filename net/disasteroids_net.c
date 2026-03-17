@@ -295,9 +295,33 @@ static void process_message(const uint8_t* payload, int len)
         break;
 
     case SNCP_MSG_USERNAME_TAKEN:
-        dnet_log("Username taken!");
-        g_net.state = DNET_STATE_USERNAME;
+    {
+        /* Auto-retry with a numeric suffix: PLAYER -> PLAYER1 -> PLAYER2 ... */
+        if (g_net.username_retry < 9) {
+            int nlen = 0;
+            int slen;
+            g_net.username_retry++;
+            while (g_net.my_name[nlen] && nlen < DNET_MAX_NAME) nlen++;
+            /* Strip previous digit suffix if any */
+            if (nlen > 0 && g_net.my_name[nlen - 1] >= '1' &&
+                g_net.my_name[nlen - 1] <= '9') {
+                nlen--;
+            }
+            if (nlen < DNET_MAX_NAME) {
+                g_net.my_name[nlen] = '0' + g_net.username_retry;
+                g_net.my_name[nlen + 1] = '\0';
+            }
+            slen = dnet_encode_set_username(g_net.tx_buf, g_net.my_name);
+            net_transport_send(g_net.transport, g_net.tx_buf, slen);
+            g_net.state = DNET_STATE_AUTHENTICATING;
+            dnet_log("Name taken, trying...");
+        } else {
+            dnet_log("All names taken!");
+            g_net.state = DNET_STATE_DISCONNECTED;
+            g_net.status_msg = "Name unavailable";
+        }
         break;
+    }
 
     case DNET_MSG_LOBBY_STATE:
         process_lobby_state(payload, len);

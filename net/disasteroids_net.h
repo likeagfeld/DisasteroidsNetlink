@@ -110,6 +110,9 @@ typedef struct {
     int remote_input_head[DNET_MAX_PLAYERS];
     uint16_t local_frame;
 
+    /* Username retry (for duplicate name handling) */
+    int username_retry;
+
     /* Delta compression */
     uint16_t last_sent_input;   /* Last input bits sent to server */
     uint16_t send_cooldown;     /* Frames since last send (force at 15) */
