@@ -1,4 +1,4 @@
-#Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude). 
+# Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude). 
 
 # Disasteroids
 Disasteroids is a 12-player Asteroids clone for the Sega Saturn. Requires two [6 Player Adaptors](https://segaretro.org/Saturn_6_Player_Adaptor) for full twelve player support. Requires a modded Saturn or another method to get code running on actual hardware. Build the code with Jo Engine or grab an ISO from [releases](https://github.com/slinga-homebrew/Disasteroids/releases).  
