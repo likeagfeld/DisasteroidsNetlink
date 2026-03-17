@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include "main.h"
 #include "assets/assets.h"
+#include "net/disasteroids_net.h"
 
 typedef enum _PAUSE_OPTIONS
 {
@@ -396,6 +397,51 @@ static void drawPauseScoreShip(jo_3d_mesh* mesh, int xPos, int yPos, int color)
     jo_3d_pop_matrix();
 }
 
+// look up a player name by ID from lobby data
+static const char* getOnlinePlayerName(int id)
+{
+    const dnet_state_data_t* nd = dnet_get_data();
+    int i;
+    for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
+        if (nd->lobby_players[i].id == (uint8_t)id)
+            return nd->lobby_players[i].name;
+    }
+    return "";
+}
+
+// draw a string using drawLetter, max len chars
+static void drawString(const char* str, int maxLen, int color,
+                       int xPos, int yPos, int xScale, int yScale, int spacing)
+{
+    int i;
+    for (i = 0; i < maxLen && str[i] != '\0'; i++) {
+        char ch = str[i];
+        /* drawLetter handles A-Z, 0-9, and some symbols */
+        drawLetter(ch, color, xPos + (spacing * i), yPos, xScale, yScale);
+    }
+}
+
+/*
+ * Column positions for the score table.
+ * Offline: 5 columns (RANK, SHIP, LIVES, WAVES, SCORE) centered on screen.
+ * Online:  6 columns (RANK, SHIP, NAME, LIVES, WAVES, SCORE) centered on screen.
+ */
+
+/* Offline column positions (original layout, centered) */
+#define COL_OFF_RANK   (-101)
+#define COL_OFF_SHIP   (-61)
+#define COL_OFF_LIVES  (-21)
+#define COL_OFF_WAVES  (25)
+#define COL_OFF_SCORE  (71)
+
+/* Online column positions (with NAME column, re-centered) */
+#define COL_ON_RANK    (-108)
+#define COL_ON_SHIP    (-78)
+#define COL_ON_NAME    (-48)
+#define COL_ON_LIVES   (6)
+#define COL_ON_WAVES   (42)
+#define COL_ON_SCORE   (78)
+
 // legend for the score chart
 static void drawPauseLegend(void)
 {
@@ -405,38 +451,47 @@ static void drawPauseLegend(void)
     int xPos = 0;
     int yPos = -90;
     int color = g_Game.hudColor;
+    bool online = g_Game.isOnlineMode;
 
     //
-    // Legend: Rank, Character, Score, Points, Deaths
+    // Legend: Rank, Ship, [Name], Lives, Waves, Score
     //
 
-    xPos = -101;
+    xPos = online ? COL_ON_RANK : COL_OFF_RANK;
     drawLetter('R', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
     drawLetter('A', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
     drawLetter('N', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
     drawLetter('K', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
 
-    xPos = -61;
+    xPos = online ? COL_ON_SHIP : COL_OFF_SHIP;
     drawLetter('S', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
     drawLetter('H', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
     drawLetter('I', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
     drawLetter('P', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
 
-    xPos = -21;
+    if (online) {
+        xPos = COL_ON_NAME;
+        drawLetter('N', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
+        drawLetter('A', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
+        drawLetter('M', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
+        drawLetter('E', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
+    }
+
+    xPos = online ? COL_ON_LIVES : COL_OFF_LIVES;
     drawLetter('L', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
     drawLetter('I', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
     drawLetter('V', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
     drawLetter('E', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
     drawLetter('S', color, xPos + (letterSpacing*4), yPos, xScale, yScale);
 
-    xPos = 25;
+    xPos = online ? COL_ON_WAVES : COL_OFF_WAVES;
     drawLetter('W', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
     drawLetter('A', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
     drawLetter('V', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
     drawLetter('E', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
     drawLetter('S', color, xPos + (letterSpacing*4), yPos, xScale, yScale);
 
-    xPos = 71;
+    xPos = online ? COL_ON_SCORE : COL_OFF_SCORE;
     drawLetter('S', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
     drawLetter('C', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
     drawLetter('O', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
@@ -499,6 +554,7 @@ static void drawPauseScore(void)
     int xScale = 1;
     int yScale = 1;
     int letterSpacing = 6;
+    bool online = g_Game.isOnlineMode;
 
     validateScores();
     memcpy(sortedPlayers, g_Players, sizeof(sortedPlayers));
@@ -534,7 +590,7 @@ static void drawPauseScore(void)
         yPos += 14;
 
         // rank
-        xPos = -101;
+        xPos = online ? COL_ON_RANK : COL_OFF_RANK;
 
         digit1 = ((i+1) / 10) + '0';
         digit2 = ((i+1) % 10) + '0';
@@ -545,7 +601,7 @@ static void drawPauseScore(void)
         // player ship
         mesh = g_Assets.ships[i];
 
-        xPos = -61;
+        xPos = online ? COL_ON_SHIP : COL_OFF_SHIP;
 
         // For active player, should be actual color
         // for non-player should be randomizedColor
@@ -562,8 +618,16 @@ static void drawPauseScore(void)
 
         drawPauseScoreShip(mesh, xPos, yPos, shipColor);
 
+        // name (online only)
+        if (online)
+        {
+            const char* name = getOnlinePlayerName(player->playerID);
+            xPos = COL_ON_NAME;
+            drawString(name, 8, color, xPos, yPos, xScale, yScale, letterSpacing);
+        }
+
         // lives
-        xPos = -24;
+        xPos = online ? (COL_ON_LIVES + 3) : -24;
 
         lives = player->numLives % 100;
 
@@ -576,7 +640,7 @@ static void drawPauseScore(void)
         // wave
         waves = player->score.wave % 100;
 
-        xPos  = 22;
+        xPos = online ? (COL_ON_WAVES + 3) : 22;
         digit1 = (waves / 10) + '0';
         digit2 = (waves % 10) + '0';
 
@@ -586,7 +650,7 @@ static void drawPauseScore(void)
         // points
         score = player->score.points % 1000;
 
-        xPos  = 71;
+        xPos = online ? COL_ON_SCORE : 71;
         digit1 = (score / 100) + '0';
         digit2 = ((score - ((score/100) * 100))/10) + '0';
         digit3 = (score % 10) + '0';

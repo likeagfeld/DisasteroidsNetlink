@@ -1,4 +1,29 @@
-# Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude). 
+# Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude).
+
+## Online Multiplayer (NetLink)
+Disasteroids now supports online multiplayer via the Sega Saturn NetLink modem. Up to 12 players can connect to a central server and play cooperatively or competitively over the internet.
+
+### Features
+- **Server-authoritative gameplay**: Asteroid spawning, wave progression, scoring, and ship-asteroid collisions are all managed by the server to prevent cheating and ensure consistency
+- **Custom name entry**: Grid-based character entry screen for choosing your online handle
+- **Online lobby**: See connected players, toggle ready status, start the game when all players are ready
+- **Server bots**: The host can add/remove AI-controlled bot players (easy/medium/hard difficulty) from the lobby
+- **Couch co-op online**: Connect a second controller locally and both players join the online game from the same Saturn
+- **Score screen with names**: The end-of-game ranking screen displays player names in online mode
+- **Delta-compressed input**: Inputs are only transmitted when they change, minimizing bandwidth on the 14,400 baud modem link
+- **Ship state interpolation**: Remote player ships are smoothly interpolated to reduce visual jitter
+
+### How to Connect
+1. Select **ONLINE** from the title screen
+2. Enter your name on the character grid (D-pad to move, A to select, C to backspace, Start to confirm)
+3. The Saturn dials out via the NetLink modem to the bridge server
+4. Once in the lobby, press **Start** to toggle ready; press **A** to start the game when all players are ready
+5. Use **L/R** to add/remove bots, **X** to cycle bot difficulty
+
+### Server Setup
+The Python game server and serial-to-TCP bridge are in the `tools/` directory:
+- `tools/disasteroids_server/dserver.py` — Game server (default port 4822)
+- `tools/netlink_bridge/bridge.py` — Serial-to-TCP bridge for connecting USB modems to the server
 
 # Disasteroids
 Disasteroids is a 12-player Asteroids clone for the Sega Saturn. Requires two [6 Player Adaptors](https://segaretro.org/Saturn_6_Player_Adaptor) for full twelve player support. Requires a modded Saturn or another method to get code running on actual hardware. Build the code with Jo Engine or grab an ISO from [releases](https://github.com/slinga-homebrew/Disasteroids/releases).  
