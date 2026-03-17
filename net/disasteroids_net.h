@@ -117,6 +117,17 @@ typedef struct {
     uint16_t last_sent_input;   /* Last input bits sent to server */
     uint16_t send_cooldown;     /* Frames since last send (force at 15) */
 
+    /* Ship state sync */
+    int ship_state_cooldown;    /* Frames since last SHIP_STATE sent */
+
+    /* Second local player (dual controller) */
+    uint16_t last_sent_input_p2;
+    uint16_t send_cooldown_p2;
+    int ship_state_cooldown_p2;
+
+    /* Server-authoritative mode */
+    bool server_auth_mode;      /* True when server controls asteroids */
+
     /* Timers */
     int heartbeat_counter;
     int frame_count;
@@ -199,5 +210,32 @@ void dnet_log(const char* msg);
 
 /** Enter offline mode (no modem or connection failed). */
 void dnet_enter_offline(void);
+
+/** Send local ship state to server (throttled to every 10 frames). */
+void dnet_send_ship_state(void);
+
+/** Send asteroid hit request to server. */
+void dnet_send_asteroid_hit(uint8_t slot, uint8_t scorer_id);
+
+/** Send ship-asteroid collision to server (local player hit asteroid). */
+void dnet_send_ship_asteroid_hit(uint8_t slot, uint8_t player_id);
+
+/** Send ADD_LOCAL_PLAYER for second controller. */
+void dnet_send_add_local_player(const char* name);
+
+/** Request server add a bot (0=easy, 1=medium, 2=hard). */
+void dnet_send_add_bot(uint8_t difficulty);
+
+/** Request server remove last bot. */
+void dnet_send_remove_bot(void);
+
+/** Remove second local player from the game. */
+void dnet_send_remove_local_player(void);
+
+/** Send input delta for second local player. */
+void dnet_send_input_delta_p2(uint16_t frame_num, uint16_t input_bits);
+
+/** Send ship state for second local player. */
+void dnet_send_ship_state_p2(void);
 
 #endif /* DISASTEROIDS_NET_H */

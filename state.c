@@ -4,6 +4,7 @@
 #include "gameplay.h"
 #include "ssmtf_logo.h"
 #include "title_screen.h"
+#include "name_entry.h"
 #include "connecting.h"
 #include "lobby.h"
 #include "assets/audio.h"
@@ -32,6 +33,12 @@ void transitionState(GAME_STATE newState)
             g_Game.isOnlineMode = false;
             titleScreen_init();
             g_Game.gameState = GAME_STATE_TITLE_SCREEN;
+            break;
+        }
+        case GAME_STATE_NAME_ENTRY:
+        {
+            nameEntry_init();
+            g_Game.gameState = GAME_STATE_NAME_ENTRY;
             break;
         }
         case GAME_STATE_CONNECTING:

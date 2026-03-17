@@ -17,7 +17,7 @@
 static void getGameplayPlayersInput(void);
 static uint16_t packLocalInput(int playerID);
 static void getOnlinePlayersInput(void);
-static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits);
+static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits, bool isLocal);
 static void updateGameplayPlayers(void);
 
 // gameplay state
@@ -89,23 +89,51 @@ void gameplay_update(void)
         return;
     }
 
-    // check for round and end game conditions
-    isWaveOver();
-    isGameOver();
+    if(g_Game.isOnlineMode)
+    {
+        // Server controls wave/gameover/alien — but handle game-over countdown locally
+        if(g_Game.isGameOver == true)
+        {
+            g_Game.gameOverFrames--;
+            if(g_Game.gameOverFrames <= 0)
+            {
+                // Show the ranked score screen (same as offline game over)
+                // Pause menu handles LOBBY vs RESTART based on isOnlineMode
+                pauseGame(GAME_OVER_TRACK);
+            }
+            return;
+        }
 
-    // game objects
-    updateDisasteroids();
-    updateProjectiles();
-    updateAlienProjectiles();
-    updateExplosions();
-    updateShipDebris();
-    updateGameplayPlayers();
-    updateAlien();
+        updateDisasteroids();    // deterministic physics, same on all Saturns
+        updateProjectiles();     // local cosmetic
+        updateExplosions();
+        updateShipDebris();
+        updateGameplayPlayers(); // local ship physics
 
-    // collisions
-    checkForAlienCollisions();
-    checkForDisasteroidCollisions();
-    checkForPlayerCollisions();
+        // In online mode, only check projectile-asteroid and ship-ship collisions
+        checkForDisasteroidCollisions();
+        checkForPlayerCollisions();
+    }
+    else
+    {
+        // check for round and end game conditions
+        isWaveOver();
+        isGameOver();
+
+        // game objects
+        updateDisasteroids();
+        updateProjectiles();
+        updateAlienProjectiles();
+        updateExplosions();
+        updateShipDebris();
+        updateGameplayPlayers();
+        updateAlien();
+
+        // collisions
+        checkForAlienCollisions();
+        checkForDisasteroidCollisions();
+        checkForPlayerCollisions();
+    }
 
     return;
 }
@@ -280,7 +308,8 @@ static uint16_t packLocalInput(int playerID)
 }
 
 // apply a network input bitmask to a player (same logic as controller input)
-static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits)
+// isLocal=false skips thrust/friction so remote ships coast on server velocity
+static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits, bool isLocal)
 {
     if(player->objectState != OBJECT_STATE_ACTIVE) return;
     if(player->respawnFrames > 0) return;
@@ -296,16 +325,21 @@ static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits)
         player->input.pressedX = false;
     }
 
-    // Rotation
-    if (bits & DNET_INPUT_LEFT) {
-        if(player->input.pressedLeft == false) {
-            player->curPos.drot = -Z_SPEED_INC;
-        }
-    } else if (bits & DNET_INPUT_RIGHT) {
-        if(player->input.pressedRight == false) {
-            player->curPos.drot = Z_SPEED_INC;
+    // Rotation — local only. Remote rotation comes from SHIP_SYNC.
+    if (isLocal) {
+        if (bits & DNET_INPUT_LEFT) {
+            if(player->input.pressedLeft == false) {
+                player->curPos.drot = -Z_SPEED_INC;
+            }
+        } else if (bits & DNET_INPUT_RIGHT) {
+            if(player->input.pressedRight == false) {
+                player->curPos.drot = Z_SPEED_INC;
+            }
+        } else {
+            player->curPos.drot = 0;
         }
     } else {
+        // Remote: drot=0, rotation is snapped by SHIP_SYNC
         player->curPos.drot = 0;
     }
 
@@ -325,22 +359,29 @@ static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits)
         player->input.pressedAC = false;
     }
 
-    // Thrusting
+    // Thrusting — only apply velocity changes for local players.
+    // Remote players get velocity from SHIP_SYNC; just update visual flag.
     if ((bits & DNET_INPUT_UP) || (bits & DNET_INPUT_B)) {
-        player->curPos.dx += jo_fixed_sin(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
-        player->curPos.dy -= jo_fixed_cos(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
+        if (isLocal) {
+            player->curPos.dx += jo_fixed_sin(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
+            player->curPos.dy -= jo_fixed_cos(jo_fixed_mult(toFIXED(player->curPos.rot), JO_FIXED_PI_DIV_180));
+        }
         player->isThrusting = true;
     } else {
-        player->curPos.dx -= jo_fixed_mult(FRICTION, player->curPos.dx);
-        player->curPos.dy -= jo_fixed_mult(FRICTION, player->curPos.dy);
+        if (isLocal) {
+            player->curPos.dx -= jo_fixed_mult(FRICTION, player->curPos.dx);
+            player->curPos.dy -= jo_fixed_mult(FRICTION, player->curPos.dy);
+        }
         player->isThrusting = false;
     }
 
-    // Speed bounds
-    if(player->curPos.dx > MAX_SPEED_X) player->curPos.dx = MAX_SPEED_X;
-    else if(player->curPos.dx < MIN_SPEED_X) player->curPos.dx = MIN_SPEED_X;
-    if(player->curPos.dy > MAX_SPEED_Y) player->curPos.dy = MAX_SPEED_Y;
-    else if(player->curPos.dy < MIN_SPEED_Y) player->curPos.dy = MIN_SPEED_Y;
+    // Speed bounds (local only — remote velocity comes from server)
+    if (isLocal) {
+        if(player->curPos.dx > MAX_SPEED_X) player->curPos.dx = MAX_SPEED_X;
+        else if(player->curPos.dx < MIN_SPEED_X) player->curPos.dx = MIN_SPEED_X;
+        if(player->curPos.dy > MAX_SPEED_Y) player->curPos.dy = MAX_SPEED_Y;
+        else if(player->curPos.dy < MIN_SPEED_Y) player->curPos.dy = MIN_SPEED_Y;
+    }
 }
 
 // online mode input: local player sends inputs, all others receive from network
@@ -355,24 +396,39 @@ static void getOnlinePlayersInput(void)
     frame = (uint16_t)(g_Game.netFrameCount & 0xFFFF);
     g_Game.netFrameCount++;
 
+    // P2 controller hot-plug detection during gameplay
+    if (g_Game.hasSecondLocal && getP2Port() < 0) {
+        // Controller 2 unplugged mid-game
+        g_Game.hasSecondLocal = false;
+        dnet_send_remove_local_player();
+        g_Game.myPlayerID2 = 0xFF;
+    }
+
     for(i = 0; i < COUNTOF(g_Players); i++)
     {
         if(g_Players[i].objectState != OBJECT_STATE_ACTIVE)
             continue;
 
         if(i == (unsigned int)my_id) {
-            // Local player: always read from controller port 0 (pad 1)
+            // Local player 1: always read from controller port 0 (pad 1)
             local_bits = packLocalInput(0);
-            applyInputBitsToPlayer(&g_Players[i], local_bits);
+            applyInputBitsToPlayer(&g_Players[i], local_bits, true);
             dnet_send_input_delta(frame, local_bits);
+            dnet_send_ship_state(); // throttled internally to every 10 frames
+        } else if(g_Game.hasSecondLocal && i == (unsigned int)g_Game.myPlayerID2) {
+            // Local player 2: read from second controller port
+            local_bits = packLocalInput(getP2Port() >= 0 ? getP2Port() : 6);
+            applyInputBitsToPlayer(&g_Players[i], local_bits, true);
+            dnet_send_input_delta_p2(frame, local_bits);
+            dnet_send_ship_state_p2();
         } else {
             // Remote player: read from network buffer
             remote_bits = dnet_get_remote_input(frame, (uint8_t)i);
             if(remote_bits >= 0) {
-                applyInputBitsToPlayer(&g_Players[i], (uint16_t)remote_bits);
+                applyInputBitsToPlayer(&g_Players[i], (uint16_t)remote_bits, false);
             } else {
                 // No remote input yet — idle (no buttons)
-                applyInputBitsToPlayer(&g_Players[i], 0);
+                applyInputBitsToPlayer(&g_Players[i], 0, false);
             }
         }
     }

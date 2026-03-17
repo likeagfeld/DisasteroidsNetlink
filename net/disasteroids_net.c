@@ -7,6 +7,12 @@
 
 #include <string.h>
 #include "disasteroids_net.h"
+#include "../main.h"
+#include "../objects/disasteroid.h"
+#include "../objects/ship.h"
+#include "../objects/explosion.h"
+#include "../objects/projectile.h"
+#include "../assets/assets.h"
 
 /*============================================================================
  * Static State
@@ -150,6 +156,13 @@ static void process_welcome(const uint8_t* payload, int len)
     g_net.state = DNET_STATE_LOBBY;
     g_net.status_msg = "In Lobby";
     dnet_log("Welcome! You are Player");
+
+    /* If we have a second local player, register them now */
+    if (g_Game.hasSecondLocal && g_Game.playerName2[0] != '\0') {
+        int slen = dnet_encode_add_local_player(g_net.tx_buf, g_Game.playerName2);
+        net_transport_send(g_net.transport, g_net.tx_buf, slen);
+        dnet_log("Registering Player 2...");
+    }
 }
 
 static void process_username_required(void)
@@ -213,13 +226,27 @@ static void process_game_start(const uint8_t* payload, int len)
     g_net.my_player_id = payload[5];
     g_net.opponent_count = payload[6];
     g_net.game_type = payload[7];
+    g_net.num_lives = 3; /* default */
     if (len > 8) g_net.num_lives = payload[8];
+
+    /* Validate player ID is within bounds */
+    if (g_net.my_player_id >= MAX_PLAYERS) {
+        dnet_log("Bad player ID from server!");
+        g_net.state = DNET_STATE_DISCONNECTED;
+        g_net.status_msg = "Server error";
+        return;
+    }
 
     g_net.state = DNET_STATE_PLAYING;
     g_net.status_msg = "Playing";
     g_net.local_frame = 0;
     g_net.last_sent_input = 0;
     g_net.send_cooldown = 15; /* Force immediate send on first frame */
+    g_net.ship_state_cooldown = 10; /* Force immediate ship state send */
+    g_net.last_sent_input_p2 = 0;
+    g_net.send_cooldown_p2 = 15;
+    g_net.ship_state_cooldown_p2 = 10;
+    g_net.server_auth_mode = true;
 
     /* Clear per-player input buffers */
     memset(g_net.remote_inputs, 0, sizeof(g_net.remote_inputs));
@@ -244,6 +271,7 @@ static void process_input_relay(const uint8_t* payload, int len)
 
     /* Don't store our own input (server echoes to all) */
     if (player_id == g_net.my_player_id) return;
+    if (g_Game.hasSecondLocal && player_id == g_Game.myPlayerID2) return;
     if (player_id >= DNET_MAX_PLAYERS) return;
 
     /* Store in per-player ring buffer */
@@ -259,7 +287,16 @@ static void process_game_over(const uint8_t* payload, int len)
 {
     (void)payload;
     (void)len;
+
     dnet_log("Game Over!");
+
+    /* Trigger game over state — countdown then return to lobby */
+    g_Game.isGameOver = true;
+    g_Game.gameOverFrames = GAME_OVER_TIMER;
+
+    /* Return network state to lobby so we can rejoin */
+    g_net.state = DNET_STATE_LOBBY;
+    g_net.status_msg = "In Lobby";
 }
 
 static void process_pause_ack(const uint8_t* payload, int len)
@@ -275,6 +312,214 @@ static void process_log(const uint8_t* payload, int len)
     if (len < 2) return;
     dnet_read_string(&payload[1], len - 1, msg, sizeof(msg));
     dnet_log(msg);
+}
+
+/*============================================================================
+ * Byte-read helpers (big-endian)
+ *============================================================================*/
+
+static inline int32_t read_i32(const uint8_t* p)
+{
+    return (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                   | ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+}
+
+static inline int16_t read_i16(const uint8_t* p)
+{
+    return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline uint16_t read_u16(const uint8_t* p)
+{
+    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+/*============================================================================
+ * Server-Authoritative Message Handlers
+ *============================================================================*/
+
+extern DISASTEROID g_Disasteroids[MAX_DISASTEROIDS];
+
+static void process_ship_sync(const uint8_t* payload, int len)
+{
+    uint8_t pid;
+    PPLAYER player;
+
+    /* [type:1][player_id:1][x:4][y:4][dx:4][dy:4][rot:2][flags:1] = 21 */
+    if (len < 21) return;
+
+    pid = payload[1];
+    if (pid >= MAX_PLAYERS) return;
+    if (pid == g_net.my_player_id) return; /* ignore own echo */
+    if (g_Game.hasSecondLocal && pid == g_Game.myPlayerID2) return; /* ignore P2 echo */
+
+    player = &g_Players[pid];
+    if (player->objectState != OBJECT_STATE_ACTIVE) return;
+
+    /* Snap velocity and rotation from server */
+    player->curPos.dx = (jo_fixed)read_i32(&payload[10]);
+    player->curPos.dy = (jo_fixed)read_i32(&payload[14]);
+    player->curPos.rot = (jo_fixed)read_i16(&payload[18]);
+
+    /* flags: bit0=alive, bit1=invuln, bit2=thrust */
+    player->isThrusting = (payload[20] & 0x04) ? true : false;
+
+    /* Smooth position correction toward server position (wrap-aware) */
+    {
+        jo_fixed tx = (jo_fixed)read_i32(&payload[2]);
+        jo_fixed ty = (jo_fixed)read_i32(&payload[6]);
+        jo_fixed dx_pos = tx - player->curPos.x;
+        jo_fixed dy_pos = ty - player->curPos.y;
+
+        /* If delta is larger than half the screen, wrap the short way */
+        if (dx_pos > SCREEN_MAX_X)       dx_pos -= (SCREEN_MAX_X - SCREEN_MIN_X);
+        else if (dx_pos < SCREEN_MIN_X)  dx_pos += (SCREEN_MAX_X - SCREEN_MIN_X);
+        if (dy_pos > SCREEN_MAX_Y)       dy_pos -= (SCREEN_MAX_Y - SCREEN_MIN_Y);
+        else if (dy_pos < SCREEN_MIN_Y)  dy_pos += (SCREEN_MAX_Y - SCREEN_MIN_Y);
+
+        /* Small error (<3 pixels): snap directly. Large error: lerp 75%. */
+        if (JO_ABS(dx_pos) < toFIXED(3) && JO_ABS(dy_pos) < toFIXED(3)) {
+            player->curPos.x = tx;
+            player->curPos.y = ty;
+        } else {
+            /* 75% correction: move 3/4 of the way to server position */
+            player->curPos.x += dx_pos - (dx_pos >> 2);
+            player->curPos.y += dy_pos - (dy_pos >> 2);
+        }
+    }
+}
+
+static void process_asteroid_spawn(const uint8_t* payload, int len)
+{
+    /* [type:1][slot:1][x:4][y:4][dx:4][dy:4][size:1][type:1] = 20 */
+    if (len < 20) return;
+
+    spawnDisasteroidFromServer(
+        payload[1],
+        (jo_fixed)read_i32(&payload[2]),
+        (jo_fixed)read_i32(&payload[6]),
+        (jo_fixed)read_i32(&payload[10]),
+        (jo_fixed)read_i32(&payload[14]),
+        payload[18],
+        payload[19]
+    );
+}
+
+static void process_asteroid_destroy(const uint8_t* payload, int len)
+{
+    uint8_t slot, scorer_id, num_children;
+    int off, i;
+
+    /* [type:1][slot:1][scorer_id:1][num_children:1] = 4 minimum */
+    if (len < 4) return;
+
+    slot = payload[1];
+    scorer_id = payload[2];
+    num_children = payload[3];
+
+    /* Award score if scorer is valid */
+    if (scorer_id != 0xFF && scorer_id < MAX_PLAYERS)
+    {
+        g_Players[scorer_id].score.points += DISASTEROID_DESTROY_POINTS;
+    }
+
+    /* Spawn children from server data before destroying parent */
+    off = 4;
+    for (i = 0; i < num_children && off + 11 <= len; i++)
+    {
+        /* [child_slot:1][child_dx:4][child_dy:4][child_size:1][child_type:1] = 11 */
+        splitDisasteroidFromServer(
+            slot,
+            payload[off],
+            (jo_fixed)read_i32(&payload[off + 1]),
+            (jo_fixed)read_i32(&payload[off + 5]),
+            payload[off + 9],
+            payload[off + 10]
+        );
+        off += 11;
+    }
+
+    /* Destroy the parent asteroid (cosmetic effects) */
+    destroyDisasteroidFromServer(slot);
+}
+
+static void process_wave_event(const uint8_t* payload, int len)
+{
+    uint8_t wave, count;
+    uint16_t spawn_timer;
+    int off, i;
+
+    /* [type:1][wave:1][count:1][timer_hi:1][timer_lo:1] = 5 minimum */
+    if (len < 5) return;
+
+    wave = payload[1];
+    count = payload[2];
+    spawn_timer = read_u16(&payload[3]);
+
+    /* Clear all existing asteroids */
+    memset(g_Disasteroids, 0, sizeof(g_Disasteroids));
+
+    g_Game.wave = wave;
+    g_Game.disasteroidSpawnFrames = spawn_timer;
+
+    /* Spawn asteroids from server data */
+    off = 5;
+    for (i = 0; i < count && off + 18 <= len; i++)
+    {
+        /* [x:4][y:4][dx:4][dy:4][size:1][type:1] = 18 per asteroid */
+        if (i < MAX_DISASTEROIDS)
+        {
+            spawnDisasteroidFromServer(
+                i,
+                (jo_fixed)read_i32(&payload[off]),
+                (jo_fixed)read_i32(&payload[off + 4]),
+                (jo_fixed)read_i32(&payload[off + 8]),
+                (jo_fixed)read_i32(&payload[off + 12]),
+                payload[off + 16],
+                payload[off + 17]
+            );
+        }
+        off += 18;
+    }
+
+    /* Clear projectiles on wave change */
+    initProjectiles();
+
+    dnet_log("Wave started!");
+}
+
+static void process_player_kill(const uint8_t* payload, int len)
+{
+    uint8_t pid, lives;
+    int16_t angle;
+    uint16_t invuln, respawn;
+
+    /* [type:1][player_id:1][lives:1][angle:2][invuln:2][respawn:2] = 9 */
+    if (len < 9) return;
+
+    pid = payload[1];
+    lives = payload[2];
+    angle = read_i16(&payload[3]);
+    invuln = read_u16(&payload[5]);
+    respawn = read_u16(&payload[7]);
+
+    destroyPlayerFromServer(pid, lives, angle, invuln, respawn);
+}
+
+static void process_player_spawn(const uint8_t* payload, int len)
+{
+    uint8_t pid;
+    int16_t angle;
+    uint16_t invuln;
+
+    /* [type:1][player_id:1][angle:2][invuln:2] = 6 */
+    if (len < 6) return;
+
+    pid = payload[1];
+    angle = read_i16(&payload[2]);
+    invuln = read_u16(&payload[4]);
+
+    spawnPlayerFromServer(pid, angle, invuln);
 }
 
 static void process_message(const uint8_t* payload, int len)
@@ -353,6 +598,38 @@ static void process_message(const uint8_t* payload, int len)
 
     case DNET_MSG_PLAYER_LEAVE:
         dnet_log("Player left!");
+        break;
+
+    case DNET_MSG_SHIP_SYNC:
+        process_ship_sync(payload, len);
+        break;
+
+    case DNET_MSG_ASTEROID_SPAWN:
+        process_asteroid_spawn(payload, len);
+        break;
+
+    case DNET_MSG_ASTEROID_DESTROY:
+        process_asteroid_destroy(payload, len);
+        break;
+
+    case DNET_MSG_WAVE_EVENT:
+        process_wave_event(payload, len);
+        break;
+
+    case DNET_MSG_PLAYER_KILL:
+        process_player_kill(payload, len);
+        break;
+
+    case DNET_MSG_PLAYER_SPAWN:
+        process_player_spawn(payload, len);
+        break;
+
+    case DNET_MSG_LOCAL_PLAYER_ACK:
+        /* [type:1][player_id:1] — ignore provisional 0xFF */
+        if (len >= 2 && payload[1] != 0xFF) {
+            g_Game.myPlayerID2 = payload[1];
+            dnet_log("Player 2 joined!");
+        }
         break;
 
     default:
@@ -481,6 +758,140 @@ void dnet_send_pause(void)
     int len;
     if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
     len = dnet_encode_pause(g_net.tx_buf);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_ship_state(void)
+{
+    PPLAYER player;
+    uint8_t flags;
+    int len;
+
+    if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
+
+    /* Throttle to every 5 frames (~12fps) for smoother remote rendering */
+    g_net.ship_state_cooldown++;
+    if (g_net.ship_state_cooldown < 5) return;
+    g_net.ship_state_cooldown = 0;
+
+    player = &g_Players[g_net.my_player_id];
+    if (player->objectState != OBJECT_STATE_ACTIVE) return;
+    if (player->respawnFrames > 0) return;  /* Don't send during respawn */
+
+    flags = 0;
+    if (player->objectState == OBJECT_STATE_ACTIVE) flags |= 0x01;
+    if (player->invulnerabilityFrames > 0) flags |= 0x02;
+    if (player->isThrusting) flags |= 0x04;
+
+    len = dnet_encode_ship_state(g_net.tx_buf,
+        (int32_t)player->curPos.x,
+        (int32_t)player->curPos.y,
+        (int32_t)player->curPos.dx,
+        (int32_t)player->curPos.dy,
+        (int16_t)player->curPos.rot,
+        flags);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_asteroid_hit(uint8_t slot, uint8_t scorer_id)
+{
+    int len;
+    if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
+
+    len = dnet_encode_asteroid_hit(g_net.tx_buf, slot, scorer_id);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_ship_asteroid_hit(uint8_t slot, uint8_t player_id)
+{
+    int len;
+    if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
+
+    len = dnet_encode_ship_asteroid_hit(g_net.tx_buf, slot, player_id);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_add_local_player(const char* name)
+{
+    int len;
+    if (g_net.state != DNET_STATE_LOBBY || !g_net.transport) return;
+    len = dnet_encode_add_local_player(g_net.tx_buf, name);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_add_bot(uint8_t difficulty)
+{
+    int len;
+    if (g_net.state != DNET_STATE_LOBBY || !g_net.transport) return;
+    len = dnet_encode_add_bot(g_net.tx_buf, difficulty);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_remove_bot(void)
+{
+    int len;
+    if (g_net.state != DNET_STATE_LOBBY || !g_net.transport) return;
+    len = dnet_encode_remove_bot(g_net.tx_buf);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_remove_local_player(void)
+{
+    int len;
+    if (!g_net.transport) return;
+    if (g_net.state != DNET_STATE_LOBBY && g_net.state != DNET_STATE_PLAYING) return;
+    len = dnet_encode_remove_local_player(g_net.tx_buf);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_send_input_delta_p2(uint16_t frame_num, uint16_t input_bits)
+{
+    if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
+    if (g_Game.myPlayerID2 == 0xFF) return;
+
+    if (input_bits != g_net.last_sent_input_p2 || g_net.send_cooldown_p2 >= 15) {
+        int len = dnet_encode_input_state_p2(g_net.tx_buf,
+                                              g_Game.myPlayerID2,
+                                              frame_num, input_bits);
+        net_transport_send(g_net.transport, g_net.tx_buf, len);
+        g_net.last_sent_input_p2 = input_bits;
+        g_net.send_cooldown_p2 = 0;
+    } else {
+        g_net.send_cooldown_p2++;
+    }
+}
+
+void dnet_send_ship_state_p2(void)
+{
+    PPLAYER player;
+    uint8_t flags;
+    int len;
+
+    if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
+    if (g_Game.myPlayerID2 == 0xFF) return;
+
+    /* Throttle to every 5 frames (~12fps) for smoother remote rendering */
+    g_net.ship_state_cooldown_p2++;
+    if (g_net.ship_state_cooldown_p2 < 5) return;
+    g_net.ship_state_cooldown_p2 = 0;
+
+    player = &g_Players[g_Game.myPlayerID2];
+    if (player->objectState != OBJECT_STATE_ACTIVE) return;
+    if (player->respawnFrames > 0) return;  /* Don't send during respawn */
+
+    flags = 0;
+    if (player->objectState == OBJECT_STATE_ACTIVE) flags |= 0x01;
+    if (player->invulnerabilityFrames > 0) flags |= 0x02;
+    if (player->isThrusting) flags |= 0x04;
+
+    len = dnet_encode_ship_state_p2(g_net.tx_buf,
+        g_Game.myPlayerID2,
+        (int32_t)player->curPos.x,
+        (int32_t)player->curPos.y,
+        (int32_t)player->curPos.dx,
+        (int32_t)player->curPos.dy,
+        (int16_t)player->curPos.rot,
+        flags);
     net_transport_send(g_net.transport, g_net.tx_buf, len);
 }
 

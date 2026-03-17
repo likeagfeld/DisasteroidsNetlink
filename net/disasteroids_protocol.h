@@ -5,10 +5,10 @@
  * Uses the same [LEN_HI][LEN_LO][PAYLOAD...] framing as the Coup protocol.
  * Reuses SNCP auth handshake (CONNECT/WELCOME) for player authentication.
  *
- * Networking model: INPUT RELAY
- *   Each Saturn sends its local player inputs every frame.
- *   The server broadcasts all inputs to all clients.
- *   Both Saturns run the same deterministic game simulation.
+ * Networking model: SERVER-AUTHORITATIVE STATE SYNC
+ *   Each Saturn sends its local player inputs and ship state.
+ *   The server owns all randomness, asteroid spawning, and collision authority.
+ *   Saturns run deterministic asteroid physics from server-provided initial data.
  *   Server assigns player IDs and manages lobby/game lifecycle.
  *
  * Header-only: all functions are static inline.
@@ -45,6 +45,13 @@
 #define DNET_MSG_INPUT_STATE       0x11  /* Per-frame input [frame:2 BE][input:2 BE] */
 #define DNET_MSG_START_GAME_REQ    0x12  /* Request game start (no payload) */
 #define DNET_MSG_PAUSE_REQ         0x13  /* Request pause toggle (no payload) */
+#define DNET_MSG_SHIP_STATE        0x14  /* [x:4][y:4][dx:4][dy:4][rot:2][flags:1] */
+#define DNET_MSG_ASTEROID_HIT      0x15  /* [slot:1][scorer_player_id:1] */
+#define DNET_MSG_ADD_LOCAL_PLAYER  0x16  /* [name_len:1][name:N] */
+#define DNET_MSG_ADD_BOT           0x17  /* [difficulty:1] (0=easy,1=medium,2=hard) */
+#define DNET_MSG_REMOVE_BOT        0x18  /* (no payload) */
+#define DNET_MSG_REMOVE_LOCAL_PLAYER 0x19 /* (no payload) - remove second local player */
+#define DNET_MSG_SHIP_ASTEROID_HIT 0x1A  /* [slot:1][player_id:1] local player hit asteroid */
 
 /*============================================================================
  * Disasteroids Server -> Client Messages (0xA0 - 0xBF)
@@ -59,6 +66,13 @@
 #define DNET_MSG_LOG               0xA6  /* [len:1][text:N] */
 #define DNET_MSG_PAUSE_ACK         0xA7  /* [paused:1] */
 #define DNET_MSG_SETTINGS_UPDATE   0xA8  /* [game_type:1][num_lives:1] */
+#define DNET_MSG_SHIP_SYNC         0xA9  /* [player_id:1][x:4][y:4][dx:4][dy:4][rot:2][flags:1] */
+#define DNET_MSG_ASTEROID_SPAWN    0xAA  /* [slot:1][x:4][y:4][dx:4][dy:4][size:1][type:1] */
+#define DNET_MSG_ASTEROID_DESTROY  0xAB  /* [slot:1][scorer_id:1][num_children:1]{children} */
+#define DNET_MSG_WAVE_EVENT        0xAC  /* [wave:1][count:1][timer:2]{asteroids} */
+#define DNET_MSG_PLAYER_KILL       0xAD  /* [player_id:1][lives:1][angle:2][invuln:2][respawn:2] */
+#define DNET_MSG_PLAYER_SPAWN      0xAE  /* [player_id:1][angle:2][invuln:2] */
+#define DNET_MSG_LOCAL_PLAYER_ACK  0x86  /* [player_id:1] */
 
 /*============================================================================
  * Input State Bitmask (matches Jo Engine key definitions)
@@ -286,6 +300,179 @@ static inline int dnet_encode_pause(uint8_t* buf)
     buf[1] = 0x01;
     buf[2] = DNET_MSG_PAUSE_REQ;
     return 3;
+}
+
+/**
+ * Encode SHIP_STATE: local ship position for server collision + relay.
+ * [x:4][y:4][dx:4][dy:4][rot:2][flags:1] = 19 bytes payload, 21 total.
+ * x/y/dx/dy are jo_fixed (32-bit). rot is int16. flags: b0=alive, b1=invuln, b2=thrust.
+ */
+static inline int dnet_encode_ship_state(uint8_t* buf,
+                                          int32_t x, int32_t y,
+                                          int32_t dx, int32_t dy,
+                                          int16_t rot, uint8_t flags)
+{
+    /* payload = type(1) + x(4) + y(4) + dx(4) + dy(4) + rot(2) + flags(1) = 20 */
+    buf[0] = 0x00;
+    buf[1] = 20;
+    buf[2] = DNET_MSG_SHIP_STATE;
+    buf[3]  = (uint8_t)((x >> 24) & 0xFF);
+    buf[4]  = (uint8_t)((x >> 16) & 0xFF);
+    buf[5]  = (uint8_t)((x >> 8) & 0xFF);
+    buf[6]  = (uint8_t)(x & 0xFF);
+    buf[7]  = (uint8_t)((y >> 24) & 0xFF);
+    buf[8]  = (uint8_t)((y >> 16) & 0xFF);
+    buf[9]  = (uint8_t)((y >> 8) & 0xFF);
+    buf[10] = (uint8_t)(y & 0xFF);
+    buf[11] = (uint8_t)((dx >> 24) & 0xFF);
+    buf[12] = (uint8_t)((dx >> 16) & 0xFF);
+    buf[13] = (uint8_t)((dx >> 8) & 0xFF);
+    buf[14] = (uint8_t)(dx & 0xFF);
+    buf[15] = (uint8_t)((dy >> 24) & 0xFF);
+    buf[16] = (uint8_t)((dy >> 16) & 0xFF);
+    buf[17] = (uint8_t)((dy >> 8) & 0xFF);
+    buf[18] = (uint8_t)(dy & 0xFF);
+    buf[19] = (uint8_t)((rot >> 8) & 0xFF);
+    buf[20] = (uint8_t)(rot & 0xFF);
+    buf[21] = flags;
+    return 22;  /* 2 header + 20 payload */
+}
+
+/**
+ * Encode ASTEROID_HIT: projectile-asteroid collision detected locally.
+ * [slot:1][scorer_player_id:1] = 2 bytes payload, 4 total.
+ */
+static inline int dnet_encode_asteroid_hit(uint8_t* buf,
+                                            uint8_t slot,
+                                            uint8_t scorer_id)
+{
+    buf[0] = 0x00;
+    buf[1] = 3;   /* payload = type(1) + slot(1) + scorer(1) */
+    buf[2] = DNET_MSG_ASTEROID_HIT;
+    buf[3] = slot;
+    buf[4] = scorer_id;
+    return 5;  /* 2 header + 3 payload */
+}
+
+/**
+ * Encode SHIP_ASTEROID_HIT: local player collided with asteroid.
+ * [slot:1][player_id:1] = 2 bytes payload, 5 total (with SNCP header).
+ */
+static inline int dnet_encode_ship_asteroid_hit(uint8_t* buf,
+                                                 uint8_t slot,
+                                                 uint8_t player_id)
+{
+    buf[0] = 0x00;
+    buf[1] = 3;   /* payload = type(1) + slot(1) + player_id(1) */
+    buf[2] = DNET_MSG_SHIP_ASTEROID_HIT;
+    buf[3] = slot;
+    buf[4] = player_id;
+    return 5;  /* 2 header + 3 payload */
+}
+
+/** Encode ADD_BOT: request server add a bot with given difficulty. */
+static inline int dnet_encode_add_bot(uint8_t* buf, uint8_t difficulty)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x02;  /* payload = type(1) + difficulty(1) */
+    buf[2] = DNET_MSG_ADD_BOT;
+    buf[3] = difficulty;
+    return 4;
+}
+
+/** Encode REMOVE_BOT: request server remove the last bot. */
+static inline int dnet_encode_remove_bot(uint8_t* buf)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x01;
+    buf[2] = DNET_MSG_REMOVE_BOT;
+    return 3;
+}
+
+/**
+ * Encode ADD_LOCAL_PLAYER: register a second local player on this connection.
+ * [name_len:1][name:N]
+ */
+static inline int dnet_encode_add_local_player(uint8_t* buf, const char* name)
+{
+    int nlen = 0;
+    int payload_len;
+    int i;
+    while (name[nlen]) nlen++;
+    if (nlen > 16) nlen = 16;
+    payload_len = 1 + 1 + nlen;  /* type + name_len + name */
+    buf[0] = (uint8_t)((payload_len >> 8) & 0xFF);
+    buf[1] = (uint8_t)(payload_len & 0xFF);
+    buf[2] = DNET_MSG_ADD_LOCAL_PLAYER;
+    buf[3] = (uint8_t)nlen;
+    for (i = 0; i < nlen; i++)
+        buf[4 + i] = (uint8_t)name[i];
+    return 2 + payload_len;
+}
+
+/** Encode REMOVE_LOCAL_PLAYER: remove the second local player. */
+static inline int dnet_encode_remove_local_player(uint8_t* buf)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x01;
+    buf[2] = DNET_MSG_REMOVE_LOCAL_PLAYER;
+    return 3;
+}
+
+/**
+ * Encode INPUT_STATE with explicit player_id (for second local player).
+ * [type:1][player_id:1][frame:2 BE][input:2 BE] = 6 bytes payload
+ */
+static inline int dnet_encode_input_state_p2(uint8_t* buf,
+                                              uint8_t player_id,
+                                              uint16_t frame_num,
+                                              uint16_t input_bits)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x06;  /* payload = type(1) + pid(1) + frame(2) + input(2) */
+    buf[2] = DNET_MSG_INPUT_STATE;
+    buf[3] = player_id;
+    buf[4] = (uint8_t)((frame_num >> 8) & 0xFF);
+    buf[5] = (uint8_t)(frame_num & 0xFF);
+    buf[6] = (uint8_t)((input_bits >> 8) & 0xFF);
+    buf[7] = (uint8_t)(input_bits & 0xFF);
+    return 8;
+}
+
+/**
+ * Encode SHIP_STATE with explicit player_id (for second local player).
+ * [type:1][player_id:1][x:4][y:4][dx:4][dy:4][rot:2][flags:1] = 21 bytes payload
+ */
+static inline int dnet_encode_ship_state_p2(uint8_t* buf,
+                                             uint8_t player_id,
+                                             int32_t x, int32_t y,
+                                             int32_t dx, int32_t dy,
+                                             int16_t rot, uint8_t flags)
+{
+    buf[0] = 0x00;
+    buf[1] = 21;
+    buf[2] = DNET_MSG_SHIP_STATE;
+    buf[3] = player_id;
+    buf[4]  = (uint8_t)((x >> 24) & 0xFF);
+    buf[5]  = (uint8_t)((x >> 16) & 0xFF);
+    buf[6]  = (uint8_t)((x >> 8) & 0xFF);
+    buf[7]  = (uint8_t)(x & 0xFF);
+    buf[8]  = (uint8_t)((y >> 24) & 0xFF);
+    buf[9]  = (uint8_t)((y >> 16) & 0xFF);
+    buf[10] = (uint8_t)((y >> 8) & 0xFF);
+    buf[11] = (uint8_t)(y & 0xFF);
+    buf[12] = (uint8_t)((dx >> 24) & 0xFF);
+    buf[13] = (uint8_t)((dx >> 16) & 0xFF);
+    buf[14] = (uint8_t)((dx >> 8) & 0xFF);
+    buf[15] = (uint8_t)(dx & 0xFF);
+    buf[16] = (uint8_t)((dy >> 24) & 0xFF);
+    buf[17] = (uint8_t)((dy >> 16) & 0xFF);
+    buf[18] = (uint8_t)((dy >> 8) & 0xFF);
+    buf[19] = (uint8_t)(dy & 0xFF);
+    buf[20] = (uint8_t)((rot >> 8) & 0xFF);
+    buf[21] = (uint8_t)(rot & 0xFF);
+    buf[22] = flags;
+    return 23;  /* 2 header + 21 payload */
 }
 
 #endif /* DISASTEROIDS_PROTOCOL_H */

@@ -43,3 +43,10 @@ void destroyDisasteroid(PDISASTEROID disasteroid, PPROJECTILE projectile);
 void splitDisasteroid(PDISASTEROID disasteroid);
 void spawnDisasteroids(void);
 bool checkAliveDisasteroids(void);
+
+/* Server-authoritative functions (online mode) */
+void spawnDisasteroidFromServer(int slot, jo_fixed x, jo_fixed y,
+                                jo_fixed dx, jo_fixed dy, int size, int type);
+void destroyDisasteroidFromServer(int slot);
+void splitDisasteroidFromServer(int slot, int child_slot,
+                                jo_fixed dx, jo_fixed dy, int size, int type);

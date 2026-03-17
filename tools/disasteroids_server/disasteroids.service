@@ -1,0 +1,16 @@
+[Unit]
+Description=Disasteroids NetLink Game Server
+After=network.target
+
+[Service]
+Type=simple
+User=gary
+WorkingDirectory=/home/gary
+ExecStart=/usr/bin/python3 /home/gary/dserver.py --port 4822 --bots 0
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

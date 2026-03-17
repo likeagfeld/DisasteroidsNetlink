@@ -102,6 +102,9 @@ void pauseGame(int track)
 // check if player 1 paused the game
 static void checkForPausePress(void)
 {
+    // No manual pause in online mode (game-over pause is triggered by code)
+    if(g_Game.isOnlineMode) return;
+
     // player 1 press start
     if (jo_is_pad1_key_pressed(JO_KEY_START))
     {
@@ -172,7 +175,17 @@ static void checkForPauseMenu(void)
                     // or unpause if paused depending on the game state
                     if(g_Game.isGameOver == true)
                     {
-                        transitionState(GAME_STATE_GAMEPLAY);
+                        if(g_Game.isOnlineMode)
+                        {
+                            // Online: return to lobby
+                            g_Game.isGameOver = false;
+                            g_Game.isPaused = false;
+                            transitionState(GAME_STATE_LOBBY);
+                        }
+                        else
+                        {
+                            transitionState(GAME_STATE_GAMEPLAY);
+                        }
                         break;
                     }
                     else
@@ -185,6 +198,11 @@ static void checkForPauseMenu(void)
                 case PAUSE_OPTIONS_QUIT:
                 {
                     // rightmost option always quits to the title screen
+                    if(g_Game.isOnlineMode && g_Game.isGameOver)
+                    {
+                        g_Game.isGameOver = false;
+                        g_Game.isPaused = false;
+                    }
                     transitionState(GAME_STATE_TITLE_SCREEN);
                     break;
                 }
@@ -441,6 +459,14 @@ static void drawPauseLegend(void)
         drawLetter('U', color, xPos + (letterSpacing*4), yPos, xScale, yScale);
         drawLetter('S', color, xPos + (letterSpacing*5), yPos, xScale, yScale);
         drawLetter('E', color, xPos + (letterSpacing*6), yPos, xScale, yScale);
+    }
+    else if(g_Game.isOnlineMode)
+    {
+        drawLetter('L', color, xPos + (letterSpacing*0), yPos, xScale, yScale);
+        drawLetter('O', color, xPos + (letterSpacing*1), yPos, xScale, yScale);
+        drawLetter('B', color, xPos + (letterSpacing*2), yPos, xScale, yScale);
+        drawLetter('B', color, xPos + (letterSpacing*3), yPos, xScale, yScale);
+        drawLetter('Y', color, xPos + (letterSpacing*4), yPos, xScale, yScale);
     }
     else
     {

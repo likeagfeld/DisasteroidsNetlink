@@ -22,7 +22,7 @@ extern void slSynch(void);
  * Configuration
  *============================================================================*/
 
-#define CONNECT_DIAL_NUMBER   "777"
+#define CONNECT_DIAL_NUMBER   "778"
 #define CONNECT_DIAL_TIMEOUT  180000000  /* ~60 seconds at 28.6MHz */
 
 /*============================================================================
@@ -69,7 +69,26 @@ void connecting_init(void)
 
     dnet_init();
     dnet_set_modem_available(g_modem_detected);
-    dnet_set_username("PLAYER");
+    dnet_set_username(g_Game.playerName[0] ? g_Game.playerName : "PLAYER");
+
+    /* Re-detect second controller (may have been plugged in after name entry) */
+    if (!g_Game.hasSecondLocal && getP2Port() >= 0) {
+        int i, p2len;
+        g_Game.hasSecondLocal = true;
+        /* Auto-generate playerName2 = playerName + "2" */
+        p2len = 0;
+        while (g_Game.playerName[p2len] && p2len < DNET_MAX_NAME) p2len++;
+        for (i = 0; i < p2len; i++)
+            g_Game.playerName2[i] = g_Game.playerName[i];
+        if (p2len < DNET_MAX_NAME) {
+            g_Game.playerName2[p2len] = '2';
+            g_Game.playerName2[p2len + 1] = '\0';
+        } else {
+            g_Game.playerName2[DNET_MAX_NAME - 1] = '2';
+            g_Game.playerName2[DNET_MAX_NAME] = '\0';
+        }
+    }
+    g_Game.myPlayerID2 = 0xFF;
 
     initStars();
 }
@@ -243,15 +262,19 @@ void connecting_draw(void)
     drawLetter('N', color,  33, yPos, 2, 2);
     drawLetter('G', color,  44, yPos, 2, 2);
 
-    /* Status message via jo_printf */
-    jo_printf(5, 17, "%s", g_connect_msg);
+    /* Status message via jo_printf (padded to clear previous longer text) */
+    jo_printf(5, 17, "%-25s", g_connect_msg);
 
-    /* Log lines */
+    /* Log lines (padded to clear stale text) */
     {
         const dnet_state_data_t* nd = dnet_get_data();
         int i;
-        for (i = 0; i < nd->log_count && i < 4; i++) {
-            jo_printf(3, 19 + i, "%s", nd->log_lines[i]);
+        for (i = 0; i < 4; i++) {
+            if (i < nd->log_count) {
+                jo_printf(3, 19 + i, "%-33s", nd->log_lines[i]);
+            } else {
+                jo_printf(3, 19 + i, "                                 ");
+            }
         }
     }
 

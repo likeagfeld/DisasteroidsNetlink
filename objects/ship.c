@@ -263,6 +263,18 @@ void drawPlayers(void)
 void destroyPlayer(PPLAYER player)
 {
     int angle = 0;
+
+    // In online mode, only do cosmetic effects — server handles lives/respawn
+    if(g_Game.isOnlineMode)
+    {
+        jo_audio_play_sound(&g_Assets.popPCM);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+        spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+        return;
+    }
+
     player->numLives--;
 
     jo_audio_play_sound(&g_Assets.popPCM);
@@ -287,6 +299,99 @@ void destroyPlayer(PPLAYER player)
     return;
 }
 
+// server-authoritative player kill (online mode)
+void destroyPlayerFromServer(int player_id, int lives, int angle,
+                             int invuln, int respawn)
+{
+    PPLAYER player;
+
+    if(player_id < 0 || player_id >= MAX_PLAYERS) return;
+    player = &g_Players[player_id];
+
+    // cosmetic effects
+    jo_audio_play_sound(&g_Assets.popPCM);
+    spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+    spawnShipDebris(player, SHIP_DEBRIS_SIZE_SMALL);
+    spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+    spawnShipDebris(player, SHIP_DEBRIS_SIZE_LARGE);
+
+    player->numLives = lives;
+
+    if(lives <= 0)
+    {
+        player->objectState = OBJECT_STATE_INACTIVE;
+        return;
+    }
+
+    // respawn with server-provided data (no local randomness)
+    player->curPos.dx = 0;
+    player->curPos.dy = 0;
+    player->invulnerabilityFrames = invuln;
+    player->respawnFrames = respawn;
+
+    {
+        jo_fixed horizontalRadius, verticalRadius;
+        if(g_Game.gameType == GAME_TYPE_VERSUS)
+        {
+            verticalRadius = toFIXED(80);
+            horizontalRadius = toFIXED(120);
+        }
+        else
+        {
+            verticalRadius = toFIXED(40);
+            horizontalRadius = toFIXED(40);
+        }
+        player->curPos.x = jo_fixed_mult(horizontalRadius, slCos(angle * 182));
+        player->curPos.y = jo_fixed_mult(verticalRadius, slSin(angle * 182));
+        player->curPos.rot = (angle + 90);
+        if(g_Game.gameType == GAME_TYPE_VERSUS)
+        {
+            player->curPos.rot += 180;
+        }
+        player->curPos.rot %= 360;
+    }
+}
+
+// server-authoritative player spawn (online mode, wave start)
+void spawnPlayerFromServer(int player_id, int angle, int invuln)
+{
+    PPLAYER player;
+    jo_fixed horizontalRadius, verticalRadius;
+
+    if(player_id < 0 || player_id >= MAX_PLAYERS) return;
+    player = &g_Players[player_id];
+
+    if(player->objectState != OBJECT_STATE_ACTIVE) return;
+
+    if(g_Game.gameType == GAME_TYPE_VERSUS)
+    {
+        verticalRadius = toFIXED(80);
+        horizontalRadius = toFIXED(120);
+        angle += 7;
+    }
+    else
+    {
+        verticalRadius = toFIXED(40);
+        horizontalRadius = toFIXED(40);
+    }
+
+    player->curPos.x = jo_fixed_mult(horizontalRadius, slCos(angle * 182));
+    player->curPos.y = jo_fixed_mult(verticalRadius, slSin(angle * 182));
+    player->curPos.dx = 0;
+    player->curPos.dy = 0;
+    player->curPos.rot = (angle + 90);
+
+    if(g_Game.gameType == GAME_TYPE_VERSUS)
+    {
+        player->curPos.rot += 180;
+    }
+
+    player->curPos.rot %= 360;
+    player->score.wave = g_Game.wave;
+    player->invulnerabilityFrames = invuln;
+    player->respawnFrames = 0;
+}
+
 // spawn starting players
 void spawnPlayers(void)
 {
@@ -295,6 +400,9 @@ void spawnPlayers(void)
     int startingDelta = 0; // 30
     PPLAYER player = NULL;
     int playerCount = 0;
+
+    // In online mode, server sends PLAYER_SPAWN instead
+    if(g_Game.isOnlineMode) return;
 
     numPlayers = countAlivePlayers();
 

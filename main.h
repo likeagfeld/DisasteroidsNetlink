@@ -9,6 +9,9 @@
 
 #define GAME_VERSION "1.10"
 #define MAX_DEBUG_LEVEL (1)
+#ifndef DNET_MAX_NAME
+#define DNET_MAX_NAME 16
+#endif
 
 // supported game types
 typedef enum _GAME_TYPE
@@ -74,6 +77,16 @@ typedef struct _GAME
     // which player index this Saturn controls (assigned by server)
     unsigned char myPlayerID;
 
+    // second local player ID (0xFF = none)
+    unsigned char myPlayerID2;
+
+    // true if second controller detected for online
+    bool hasSecondLocal;
+
+    // player names for online
+    char playerName[DNET_MAX_NAME + 1];
+    char playerName2[DNET_MAX_NAME + 1];
+
     // frame counter for network input sync
     unsigned int netFrameCount;
 
@@ -82,3 +95,14 @@ typedef struct _GAME
 // globals
 extern PLAYER g_Players[MAX_PLAYERS];
 extern GAME g_Game;
+
+// Second controller port detection.
+// Without a multitap, Port B (second physical controller port) maps to
+// jo_inputs[6] in Jo Engine's input array. With a multitap on Port A,
+// the second device maps to jo_inputs[1]. Check both.
+static inline int getP2Port(void)
+{
+    if (jo_is_input_available(1)) return 1;   /* multitap slot */
+    if (jo_is_input_available(6)) return 6;   /* Port B direct */
+    return -1;
+}

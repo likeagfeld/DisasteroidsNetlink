@@ -5,6 +5,7 @@
 #include "objects/disasteroid.h"
 #include "objects/ship.h"
 #include "objects/star.h"
+#include "net/disasteroids_net.h"
 
 // globals for menu options
 int g_TitleScreenChoice = 0;
@@ -195,7 +196,13 @@ void titleScreen_input(void)
                     }
 
                     g_Game.isOnlineMode = true;
-                    transitionState(GAME_STATE_CONNECTING);
+
+                    /* If still connected to server, skip straight to lobby */
+                    if (dnet_get_state() == DNET_STATE_LOBBY) {
+                        transitionState(GAME_STATE_LOBBY);
+                    } else {
+                        transitionState(GAME_STATE_NAME_ENTRY);
+                    }
                     break;
                 }
             }

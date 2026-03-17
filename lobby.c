@@ -13,11 +13,28 @@
 #include "objects/star.h"
 
 /*============================================================================
+ * Bot difficulty
+ *============================================================================*/
+
+static int g_bot_difficulty = 1;  /* 0=easy, 1=medium, 2=hard */
+
+static const char* difficultyName(int d)
+{
+    switch(d) {
+        case 0: return "EASY";
+        case 1: return "MEDIUM";
+        case 2: return "HARD";
+        default: return "?";
+    }
+}
+
+/*============================================================================
  * Callbacks
  *============================================================================*/
 
 void lobby_init(void)
 {
+    g_bot_difficulty = 1;
     initStars();
 }
 
@@ -46,15 +63,56 @@ void lobby_input(void)
         g_Game.input.pressedStart = false;
     }
 
-    /* B = disconnect and return to title */
+    /* B = return to title (stay connected for quick rejoin) */
     if (jo_is_pad1_key_pressed(JO_KEY_B)) {
         if (g_Game.input.pressedB == false) {
-            dnet_send_disconnect();
             transitionState(GAME_STATE_TITLE_SCREEN);
         }
         g_Game.input.pressedB = true;
     } else {
         g_Game.input.pressedB = false;
+    }
+
+    /* Y = fully disconnect and return to title */
+    if (jo_is_pad1_key_pressed(JO_KEY_Y)) {
+        if (g_Game.input.pressedY == false) {
+            dnet_send_disconnect();
+            transitionState(GAME_STATE_TITLE_SCREEN);
+        }
+        g_Game.input.pressedY = true;
+    } else {
+        g_Game.input.pressedY = false;
+    }
+
+    /* L trigger = add bot */
+    if (jo_is_pad1_key_pressed(JO_KEY_L)) {
+        if (g_Game.input.pressedLT == false) {
+            dnet_send_add_bot((uint8_t)g_bot_difficulty);
+        }
+        g_Game.input.pressedLT = true;
+    } else {
+        g_Game.input.pressedLT = false;
+    }
+
+    /* R trigger = remove bot */
+    if (jo_is_pad1_key_pressed(JO_KEY_R)) {
+        if (g_Game.input.pressedRT == false) {
+            dnet_send_remove_bot();
+        }
+        g_Game.input.pressedRT = true;
+    } else {
+        g_Game.input.pressedRT = false;
+    }
+
+    /* X = cycle bot difficulty */
+    if (jo_is_pad1_key_pressed(JO_KEY_X)) {
+        if (g_Game.input.pressedX == false) {
+            g_bot_difficulty++;
+            if (g_bot_difficulty > 2) g_bot_difficulty = 0;
+        }
+        g_Game.input.pressedX = true;
+    } else {
+        g_Game.input.pressedX = false;
     }
 }
 
@@ -63,6 +121,32 @@ void lobby_update(void)
     if (g_Game.gameState != GAME_STATE_LOBBY) return;
 
     updateStars();
+
+    /* P2 controller hot-plug detection */
+    if (!g_Game.hasSecondLocal && getP2Port() >= 0) {
+        /* Controller 2 just plugged in — register P2 */
+        int i, p2len;
+        g_Game.hasSecondLocal = true;
+        p2len = 0;
+        while (g_Game.playerName[p2len] && p2len < DNET_MAX_NAME) p2len++;
+        for (i = 0; i < p2len; i++)
+            g_Game.playerName2[i] = g_Game.playerName[i];
+        if (p2len < DNET_MAX_NAME) {
+            g_Game.playerName2[p2len] = '2';
+            g_Game.playerName2[p2len + 1] = '\0';
+        } else {
+            g_Game.playerName2[DNET_MAX_NAME - 1] = '2';
+            g_Game.playerName2[DNET_MAX_NAME] = '\0';
+        }
+        g_Game.myPlayerID2 = 0xFF;
+        dnet_send_add_local_player(g_Game.playerName2);
+    } else if (g_Game.hasSecondLocal && getP2Port() < 0) {
+        /* Controller 2 unplugged — remove P2 */
+        g_Game.hasSecondLocal = false;
+        g_Game.myPlayerID2 = 0xFF;
+        g_Game.playerName2[0] = '\0';
+        dnet_send_remove_local_player();
+    }
 
     /* Network tick is done in main loop, but check state transitions */
     if (dnet_get_state() == DNET_STATE_PLAYING) {
@@ -124,16 +208,28 @@ void lobby_draw(void)
 
     /* Waiting indicator */
     if (nd->lobby_count < 2) {
-        jo_printf(5, 24, "Waiting for players...");
+        jo_printf(5, 23, "Waiting for players...");
     } else {
-        jo_printf(5, 24, "                      ");
+        jo_printf(5, 23, "                      ");
     }
 
-    /* Log lines */
-    for (i = 0; i < nd->log_count && i < 2; i++) {
-        jo_printf(3, 25 + i, "%s", nd->log_lines[i]);
+    /* Log line (1 most recent, padded to clear stale text) */
+    if (nd->log_count > 0) {
+        jo_printf(3, 24, "%-35s", nd->log_lines[nd->log_count - 1]);
+    } else {
+        jo_printf(3, 24, "                                   ");
     }
+
+    /* Show P2 status if second local player detected */
+    if (g_Game.hasSecondLocal) {
+        jo_printf(2, 25, "P2: %-16s", g_Game.playerName2);
+    } else {
+        jo_printf(2, 25, "                     ");
+    }
+
+    /* Bot difficulty + add/remove controls */
+    jo_printf(1, 26, "Bot:%-6s X:Diff L:+ R:-", difficultyName(g_bot_difficulty));
 
     /* Controls hint */
-    jo_printf(2, 27, "A:Ready  START:Go  B:Quit");
+    jo_printf(1, 27, "A:Rdy START:Go B:Back Y:Quit");
 }

@@ -38,6 +38,7 @@
 #include "title_screen.h"
 #include "gameplay.h"
 #include "pause.h"
+#include "name_entry.h"
 #include "connecting.h"
 #include "lobby.h"
 #include "net/disasteroids_net.h"
@@ -121,6 +122,10 @@ void jo_main(void)
     jo_core_add_callback(titleScreen_input);
     jo_core_add_callback(titleScreen_update);
     jo_core_add_callback(titleScreen_draw);
+
+    jo_core_add_callback(nameEntry_input);
+    jo_core_add_callback(nameEntry_update);
+    jo_core_add_callback(nameEntry_draw);
 
     jo_core_add_callback(connecting_input);
     jo_core_add_callback(connecting_update);

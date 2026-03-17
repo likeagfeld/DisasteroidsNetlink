@@ -3,6 +3,7 @@
 #include "assets/assets.h"
 #include "objects/ship.h"
 #include "objects/disasteroid.h"
+#include "net/disasteroids_net.h"
 
 extern DISASTEROID g_Disasteroids[MAX_DISASTEROIDS];
 extern PROJECTILE g_Projectiles[MAX_PROJECTILES];
@@ -32,6 +33,9 @@ static void backoffPlayers(PPLAYER playerA, PPLAYER playerB);
 // - player
 void checkForAlienCollisions(void)
 {
+    // No alien in online mode
+    if(g_Game.isOnlineMode) return;
+
     if(g_Alien.objectState != OBJECT_STATE_ACTIVE)
     {
         return;
@@ -144,6 +148,18 @@ void checkForDisasteroidCollisions(void)
     }
 }
 
+// find the slot index for a disasteroid pointer
+static int getDisasteroidSlot(PDISASTEROID disasteroid)
+{
+    int i;
+    for(i = 0; i < MAX_DISASTEROIDS; i++)
+    {
+        if(&g_Disasteroids[i] == disasteroid)
+            return i;
+    }
+    return -1;
+}
+
 // check if disasteroid is hit by a player projectile
 static void checkForDisasteroidProjectilesCollision(PDISASTEROID disasteroid)
 {
@@ -173,7 +189,20 @@ static void checkForDisasteroidProjectilesCollision(PDISASTEROID disasteroid)
                                          toINT(projectile->curPos.x), toINT(projectile->curPos.y), PROJECTILE_RADIUS);
         if(result != 0)
         {
-            // destroy the disasteroid
+            if(g_Game.isOnlineMode)
+            {
+                // Online mode: request server to destroy, don't destroy locally
+                int slot = getDisasteroidSlot(disasteroid);
+                if(slot >= 0)
+                {
+                    dnet_send_asteroid_hit((uint8_t)slot, (uint8_t)projectile->playerID);
+                }
+                // Destroy projectile locally (cosmetic)
+                projectile->objectState = OBJECT_STATE_INACTIVE;
+                return;
+            }
+
+            // Offline: destroy the disasteroid directly
             destroyDisasteroid(disasteroid, projectile);
             return;
         }
@@ -210,6 +239,22 @@ static void checkForDisasteroidPlayersCollision(PDISASTEROID disasteroid)
             continue;
         }
 
+        if(player->respawnFrames > 0)
+        {
+            // player is respawning, skip
+            continue;
+        }
+
+        // In online mode, only check collision for local players
+        if(g_Game.isOnlineMode)
+        {
+            bool isLocal = ((unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID);
+            if(g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2)
+                isLocal = true;
+            if(!isLocal)
+                continue;
+        }
+
         // add two because we have variance in sizes
         radius = getDisasteroidRadiusSize(disasteroid->size) + 2;
 
@@ -217,7 +262,22 @@ static void checkForDisasteroidPlayersCollision(PDISASTEROID disasteroid)
                                         toINT(player->curPos.x), toINT(player->curPos.y), PLAYER_SHIP_RADIUS);
         if(result != 0)
         {
-            // destroy diasteroid and player
+            if(g_Game.isOnlineMode)
+            {
+                // Online: notify server, apply cosmetic effects locally
+                int slot = getDisasteroidSlot(disasteroid);
+                if(slot >= 0)
+                {
+                    dnet_send_ship_asteroid_hit((uint8_t)slot, (uint8_t)player->playerID);
+                }
+                destroyPlayer(player);  // cosmetic only (debris + sound)
+                // Hide ship immediately while waiting for server PLAYER_KILL
+                // Server will overwrite with proper respawn timer
+                player->respawnFrames = 60;
+                return;
+            }
+
+            // Offline: destroy the disasteroid and player directly
             destroyDisasteroid(disasteroid, NULL);
             destroyPlayer(player);
             return;
@@ -294,14 +354,23 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
             if(g_Game.gameType == GAME_TYPE_COOP)
             {
                 // in coop bounce the player around
-                player->curPos.dx += projectile->curPos.dx;
-                player->curPos.dy += projectile->curPos.dy;
+                // (skip velocity push for remote players in online — server owns their physics)
+                if(!g_Game.isOnlineMode || (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID
+                   || (g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2))
+                {
+                    player->curPos.dx += projectile->curPos.dx;
+                    player->curPos.dy += projectile->curPos.dy;
+                }
             }
             else
             {
-                // in versus kill the player
+                // in versus kill the player (cosmetic in online — server handles actual death)
                 destroyPlayer(player);
-                incrementScoreByPlayerID(projectile->playerID, PVP_DESTROY_POINTS);
+                // Only score locally in offline — server is authoritative online
+                if(!g_Game.isOnlineMode)
+                {
+                    incrementScoreByPlayerID(projectile->playerID, PVP_DESTROY_POINTS);
+                }
             }
 
             projectile->objectState = OBJECT_STATE_INACTIVE;

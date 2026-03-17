@@ -18,7 +18,7 @@ import struct
 import time
 
 # Bridge auth
-SHARED_SECRET = b"SaturnCoup2025!NetLink#SecretKey"
+SHARED_SECRET = b"SaturnDisasteroids2026!NetLink#Key"
 AUTH_MAGIC = b"AUTH"
 AUTH_OK = 0x01
 
@@ -35,6 +35,8 @@ MSG_WELCOME_BACK = 0x83
 DNET_MSG_READY = 0x10
 DNET_MSG_INPUT_STATE = 0x11
 DNET_MSG_START_GAME_REQ = 0x12
+DNET_MSG_SHIP_STATE = 0x14
+DNET_MSG_ASTEROID_HIT = 0x15
 
 DNET_MSG_LOBBY_STATE = 0xA0
 DNET_MSG_GAME_START = 0xA1
@@ -44,6 +46,15 @@ DNET_MSG_PLAYER_LEAVE = 0xA4
 DNET_MSG_GAME_OVER = 0xA5
 DNET_MSG_LOG = 0xA6
 DNET_MSG_PAUSE_ACK = 0xA7
+DNET_MSG_SHIP_SYNC = 0xA9
+DNET_MSG_ASTEROID_SPAWN = 0xAA
+DNET_MSG_ASTEROID_DESTROY = 0xAB
+DNET_MSG_WAVE_EVENT = 0xAC
+DNET_MSG_PLAYER_KILL = 0xAD
+DNET_MSG_PLAYER_SPAWN = 0xAE
+
+FIXED_SCALE = 65536
+MAX_DISASTEROIDS = 50
 
 UUID_LEN = 36
 
@@ -182,6 +193,18 @@ class FakeSaturn:
         self.ai = BotAI()
         self.last_sent_bits = -1   # Force first send
         self.force_send_counter = 0
+        # Bot position (jo_fixed format, simulated)
+        self.bot_x = 0
+        self.bot_y = 0
+        self.bot_dx = 0
+        self.bot_dy = 0
+        self.bot_rot = 0
+        self.bot_alive = True
+        self.bot_invuln = 0
+        self.ship_state_cooldown = 0
+        # Asteroid state for AI decisions
+        self.asteroids = [None] * MAX_DISASTEROIDS
+        self.wave = 0
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -224,6 +247,59 @@ class FakeSaturn:
         payload += struct.pack("!HH", self.frame_num & 0xFFFF, bits & 0xFFFF)
         self.sock.sendall(encode_frame(payload))
         self.frame_num += 1
+
+    def send_ship_state(self):
+        """Send SHIP_STATE to server (throttled to every 10 frames)."""
+        self.ship_state_cooldown += 1
+        if self.ship_state_cooldown < 10:
+            return
+        self.ship_state_cooldown = 0
+
+        flags = 0
+        if self.bot_alive:
+            flags |= 0x01
+        if self.bot_invuln > 0:
+            flags |= 0x02
+
+        payload = bytes([DNET_MSG_SHIP_STATE])
+        payload += struct.pack("!iiiihB",
+                               self.bot_x, self.bot_y,
+                               self.bot_dx, self.bot_dy,
+                               self.bot_rot & 0x7FFF, flags)
+        self.sock.sendall(encode_frame(payload))
+
+    def update_bot_physics(self, bits):
+        """Simple physics simulation for bot position."""
+        import math
+        if bits & (INPUT_UP | INPUT_B):
+            rad = math.radians(self.bot_rot)
+            self.bot_dx += int(math.sin(rad) * FIXED_SCALE)
+            self.bot_dy -= int(math.cos(rad) * FIXED_SCALE)
+        if bits & INPUT_LEFT:
+            self.bot_rot -= 7
+        if bits & INPUT_RIGHT:
+            self.bot_rot += 7
+        # Clamp speed
+        max_spd = 2 * FIXED_SCALE
+        self.bot_dx = max(-max_spd, min(max_spd, self.bot_dx))
+        self.bot_dy = max(-max_spd, min(max_spd, self.bot_dy))
+        # Move
+        self.bot_x += self.bot_dx
+        self.bot_y += self.bot_dy
+        # Wrap
+        span_x = 320 * FIXED_SCALE
+        span_y = 240 * FIXED_SCALE
+        if self.bot_x > 160 * FIXED_SCALE:
+            self.bot_x -= span_x
+        elif self.bot_x < -160 * FIXED_SCALE:
+            self.bot_x += span_x
+        if self.bot_y > 120 * FIXED_SCALE:
+            self.bot_y -= span_y
+        elif self.bot_y < -120 * FIXED_SCALE:
+            self.bot_y += span_y
+        # Decrement invuln
+        if self.bot_invuln > 0:
+            self.bot_invuln -= 1
 
     def send_disconnect(self):
         self.sock.sendall(encode_frame(bytes([MSG_DISCONNECT])))
@@ -303,6 +379,16 @@ class FakeSaturn:
                 self.ai = BotAI()  # fresh AI for new game
                 self.last_sent_bits = -1  # force first send
                 self.force_send_counter = 0
+                self.bot_x = 0
+                self.bot_y = 0
+                self.bot_dx = 0
+                self.bot_dy = 0
+                self.bot_rot = 0
+                self.bot_alive = True
+                self.bot_invuln = 120
+                self.ship_state_cooldown = 10  # force immediate
+                self.asteroids = [None] * MAX_DISASTEROIDS
+                self.wave = 0
                 print("[<] GAME_START  seed=%08X  player_id=%d  opponents=%d" %
                       (seed, self.my_player_id, opp_count))
                 print("[*] Bot AI active!")
@@ -328,6 +414,76 @@ class FakeSaturn:
         elif msg_type == DNET_MSG_PLAYER_LEAVE:
             pid = payload[1] if len(payload) > 1 else 0
             print("[<] PLAYER_LEAVE  id=%d" % pid)
+
+        elif msg_type == DNET_MSG_SHIP_SYNC:
+            pass  # Remote player position — bot doesn't need it
+
+        elif msg_type == DNET_MSG_WAVE_EVENT:
+            if len(payload) >= 5:
+                self.wave = payload[1]
+                count = payload[2]
+                spawn_timer = (payload[3] << 8) | payload[4]
+                self.asteroids = [None] * MAX_DISASTEROIDS
+                off = 5
+                for i in range(count):
+                    if off + 18 > len(payload):
+                        break
+                    x = struct.unpack("!i", payload[off:off+4])[0]
+                    y = struct.unpack("!i", payload[off+4:off+8])[0]
+                    dx = struct.unpack("!i", payload[off+8:off+12])[0]
+                    dy = struct.unpack("!i", payload[off+12:off+16])[0]
+                    size = payload[off+16]
+                    atype = payload[off+17]
+                    self.asteroids[i] = {"x": x, "y": y, "dx": dx, "dy": dy,
+                                         "size": size, "type": atype, "alive": True}
+                    off += 18
+                print("[<] WAVE_EVENT  wave=%d  asteroids=%d  timer=%d" %
+                      (self.wave, count, spawn_timer))
+
+        elif msg_type == DNET_MSG_ASTEROID_DESTROY:
+            if len(payload) >= 4:
+                slot = payload[1]
+                scorer = payload[2]
+                num_children = payload[3]
+                if 0 <= slot < MAX_DISASTEROIDS and self.asteroids[slot]:
+                    self.asteroids[slot]["alive"] = False
+                print("[<] ASTEROID_DESTROY  slot=%d  scorer=%d  children=%d" %
+                      (slot, scorer, num_children))
+
+        elif msg_type == DNET_MSG_PLAYER_KILL:
+            if len(payload) >= 9:
+                pid = payload[1]
+                lives = payload[2]
+                angle = struct.unpack("!h", payload[3:5])[0]
+                invuln = struct.unpack("!H", payload[5:7])[0]
+                respawn = struct.unpack("!H", payload[7:9])[0]
+                if pid == self.my_player_id:
+                    if lives <= 0:
+                        self.bot_alive = False
+                    else:
+                        self.bot_invuln = invuln
+                print("[<] PLAYER_KILL  id=%d  lives=%d  angle=%d" %
+                      (pid, lives, angle))
+
+        elif msg_type == DNET_MSG_PLAYER_SPAWN:
+            if len(payload) >= 6:
+                pid = payload[1]
+                angle = struct.unpack("!h", payload[2:4])[0]
+                invuln = struct.unpack("!H", payload[4:6])[0]
+                if pid == self.my_player_id:
+                    import math
+                    rad = math.radians(angle)
+                    self.bot_x = int(40 * math.cos(rad) * FIXED_SCALE)
+                    self.bot_y = int(40 * math.sin(rad) * FIXED_SCALE)
+                    self.bot_dx = 0
+                    self.bot_dy = 0
+                    self.bot_rot = (angle + 90) % 360
+                    self.bot_invuln = invuln
+                print("[<] PLAYER_SPAWN  id=%d  angle=%d  invuln=%d" %
+                      (pid, angle, invuln))
+
+        elif msg_type == DNET_MSG_ASTEROID_SPAWN:
+            pass  # Individual spawn, handled implicitly via wave event
 
         else:
             print("[<] msg 0x%02X  (%d bytes)" % (msg_type, len(payload)))
@@ -355,6 +511,12 @@ class FakeSaturn:
                             break
                         self.last_sent_bits = bits
                         self.force_send_counter = 0
+                    # Update bot physics and send ship state
+                    self.update_bot_physics(bits)
+                    try:
+                        self.send_ship_state()
+                    except OSError:
+                        break
                     time.sleep(1.0 / 60.0)
                 else:
                     time.sleep(0.05)
@@ -384,7 +546,7 @@ class FakeSaturn:
 def main():
     parser = argparse.ArgumentParser(description="Fake Saturn Bot Client")
     parser.add_argument("--host", default="localhost", help="Server host")
-    parser.add_argument("--port", type=int, default=4821, help="Server port")
+    parser.add_argument("--port", type=int, default=4822, help="Server port")
     parser.add_argument("--name", default="CPUBOT", help="Player name")
     parser.add_argument("--no-ready", action="store_true", help="Don't auto-ready")
     args = parser.parse_args()

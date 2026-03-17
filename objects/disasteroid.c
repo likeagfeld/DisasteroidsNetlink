@@ -351,6 +351,9 @@ void spawnDisasteroids(void)
     PDISASTEROID disasteroid = NULL;
     int numDisasteroids = 0;
 
+    // In online mode, server sends WAVE_EVENT instead
+    if(g_Game.isOnlineMode) return;
+
     numDisasteroids = getNumberOfDisasteroids();
 
     if(numDisasteroids > MAX_DISASTEROIDS)
@@ -367,6 +370,70 @@ void spawnDisasteroids(void)
     }
 
     g_Game.disasteroidSpawnFrames = DISASTEROID_SPAWN_TIMER;
+}
+
+// spawn a single disasteroid from server data (online mode)
+void spawnDisasteroidFromServer(int slot, jo_fixed x, jo_fixed y,
+                                jo_fixed dx, jo_fixed dy, int size, int type)
+{
+    PDISASTEROID disasteroid;
+
+    if(slot < 0 || slot >= MAX_DISASTEROIDS) return;
+
+    disasteroid = &g_Disasteroids[slot];
+    memset(disasteroid, 0, sizeof(DISASTEROID));
+    disasteroid->curPos.x = x;
+    disasteroid->curPos.y = y;
+    disasteroid->curPos.dx = dx;
+    disasteroid->curPos.dy = dy;
+    disasteroid->size = size;
+    disasteroid->type = type;
+    disasteroid->objectState = OBJECT_STATE_ACTIVE;
+}
+
+// destroy a disasteroid by server command (online mode)
+void destroyDisasteroidFromServer(int slot)
+{
+    PDISASTEROID disasteroid;
+    int numExplosions;
+
+    if(slot < 0 || slot >= MAX_DISASTEROIDS) return;
+
+    disasteroid = &g_Disasteroids[slot];
+    if(disasteroid->objectState != OBJECT_STATE_ACTIVE) return;
+
+    // spawn cosmetic explosions (locally random — visual only)
+    numExplosions = jo_random(5) + 5;
+    for(int i = 0; i < numExplosions; i++)
+    {
+        spawnExplosion(disasteroid);
+    }
+
+    jo_audio_play_sound(&g_Assets.popPCM);
+    disasteroid->objectState = OBJECT_STATE_INACTIVE;
+}
+
+// split a disasteroid with server-provided child data (online mode)
+void splitDisasteroidFromServer(int slot, int child_slot,
+                                jo_fixed dx, jo_fixed dy, int size, int type)
+{
+    PDISASTEROID parent;
+    PDISASTEROID child;
+
+    if(slot < 0 || slot >= MAX_DISASTEROIDS) return;
+    if(child_slot < 0 || child_slot >= MAX_DISASTEROIDS) return;
+
+    parent = &g_Disasteroids[slot];
+    child = &g_Disasteroids[child_slot];
+
+    memset(child, 0, sizeof(DISASTEROID));
+    child->curPos.x = parent->curPos.x;
+    child->curPos.y = parent->curPos.y;
+    child->curPos.dx = dx;
+    child->curPos.dy = dy;
+    child->size = size;
+    child->type = type;
+    child->objectState = OBJECT_STATE_ACTIVE;
 }
 
 // returns true if at least one Disasteroid is still alive
