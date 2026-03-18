@@ -62,6 +62,7 @@ class Netlink:
         self.data = []
         self.state = "starting"
         self.poll_rate = 0.01
+        self._last_keepalive = time.time()  # keepalive timer to prevent USB auto-suspend
         self.matching = True
         self.udp = None
         self.mode = "idle"
@@ -1090,10 +1091,17 @@ class Netlink:
         return result
 
     def reset(self):
+        # Drain any stale data from serial buffer before re-initializing
+        try:
+            if self.modem._serial.in_waiting:
+                self.modem._serial.read(self.modem._serial.in_waiting)
+        except Exception:
+            pass
         self.modem.connect()
         self.modem.start_dial_tone()
         self.mode = "idle"
         self.state = "starting"
+        self._last_keepalive = time.time()
 
     def serial_poll(self):
         if self.usb:
@@ -1203,6 +1211,16 @@ class Netlink:
         if self.usb:
             self.serial_poll()
         if self.mode == "idle":
+            # Periodic keepalive: ping modem every 5 min to prevent USB auto-suspend
+            if time.time() - self._last_keepalive > 300:
+                self._last_keepalive = time.time()
+                try:
+                    self.modem._serial.write(b"AT\r\n")
+                    time.sleep(0.1)
+                    if self.modem._serial.in_waiting:
+                        self.modem._serial.read(self.modem._serial.in_waiting)
+                except Exception:
+                    pass
             return 0
         elif self.mode == "PPP":
             return 0
