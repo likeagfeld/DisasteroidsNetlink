@@ -101,7 +101,7 @@ sudo systemctl start disasteroids
 ```
 
 # Disasteroids
-Disasteroids is a 12-player Asteroids clone for the Sega Saturn. Requires two [6 Player Adaptors](https://segaretro.org/Saturn_6_Player_Adaptor) for full twelve player support. Requires a modded Saturn or another method to get code running on actual hardware. Build the code with Jo Engine or grab an ISO from [releases](https://github.com/slinga-homebrew/Disasteroids/releases).  
+Disasteroids is a 12-player Asteroids clone for the Sega Saturn. Requires two [6 Player Adaptors](https://segaretro.org/Saturn_6_Player_Adaptor) for full twelve player support. Requires a modded Saturn or another method to get code running on actual hardware. Build the code with Jo Engine or grab an ISO from [releases](https://github.com/likeagfeld/DisasteroidsNetlink/releases).  
 
 Disasteroids was my entry to the [Sega Saturn 28th Anniversary Game Competition](https://segaxtreme.net/threads/sega-saturn-28th-anniversary-game-competition.25278/).  
 
