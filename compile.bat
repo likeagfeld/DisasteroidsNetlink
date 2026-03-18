@@ -19,6 +19,7 @@ IF %ERRORLEVEL% NEQ 0 (
             IF EXIST game.iso (
                 ECHO === ISO created successfully! ===
                 JoEngineCueMaker.exe
+                CALL :PACKAGE_GAME
             ) ELSE (
                 ECHO === ISO creation failed. game.elf and cd\0.bin are ready for manual ISO creation. ===
             )
@@ -35,8 +36,37 @@ IF %ERRORLEVEL% NEQ 0 (
     IF EXIST game.iso (
         JoEngineCueMaker.exe
         ECHO === CUE file generated with audio tracks ===
+        CALL :PACKAGE_GAME
     )
 )
 
 ECHO.
 PAUSE
+GOTO :EOF
+
+:PACKAGE_GAME
+ECHO.
+ECHO === Packaging Game Files ===
+IF EXIST "Game Files" RMDIR /S /Q "Game Files"
+MKDIR "Game Files"
+MKDIR "Game Files\Online"
+MKDIR "Game Files\Online\DreamPi"
+MKDIR "Game Files\Online\PC Bridge"
+
+COPY /Y game.cue "Game Files\game.cue" >NUL
+COPY /Y game.iso "Game Files\game.iso" >NUL
+COPY /Y 02_TITLE.WAV "Game Files\02_TITLE.WAV" >NUL
+COPY /Y 03_PAUSE.WAV "Game Files\03_PAUSE.WAV" >NUL
+COPY /Y 04_VICTORY.WAV "Game Files\04_VICTORY.WAV" >NUL
+COPY /Y 05_GAMEOVER.WAV "Game Files\05_GAMEOVER.WAV" >NUL
+
+COPY /Y tools\dreampi\netlink.py "Game Files\Online\DreamPi\netlink.py" >NUL
+COPY /Y tools\dreampi\config.ini "Game Files\Online\DreamPi\config.ini" >NUL
+
+COPY /Y tools\netlink_bridge\bridge.py "Game Files\Online\PC Bridge\bridge.py" >NUL
+COPY /Y tools\netlink_bridge\start_bridge.bat "Game Files\Online\PC Bridge\start_bridge.bat" >NUL
+
+COPY /Y README_ONLINE.txt "Game Files\Online\README.TXT" >NUL
+
+ECHO === Game Files folder ready! ===
+GOTO :EOF
