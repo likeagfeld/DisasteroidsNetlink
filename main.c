@@ -55,6 +55,26 @@ PLAYER g_Players[MAX_PLAYERS] = {0};
 saturn_uart16550_t g_uart = {0};
 bool g_modem_detected = false;
 
+/*============================================================================
+ * NetLink modem board control register
+ *
+ * Address 0x25885031 is a board-level control register on the NetLink
+ * hardware, separate from the 16550 UART registers. Bit 7 controls the
+ * front-panel activity LED. This is the mechanism used by Japanese XBAND
+ * games (Dragon's Dream, Saturn Bomberman for SegaNet) to blink the modem
+ * LED during online gameplay.
+ *
+ * Evidence: Dragon's Dream LED ON at 0x060406AE, LED OFF at 0x060406C2.
+ * Bomberman JP XBLIBNET.BIN set_board_ctrl() at file offset 0x0680.
+ * US H2HLIBUS.BIN has no equivalent — LED does not blink on US games.
+ *
+ * Safe to toggle at any time — does NOT affect UART TX/RX.
+ *============================================================================*/
+#define NETLINK_BOARD_CTRL  (*(volatile uint8_t*)0x25885031)
+#define NETLINK_BUS_STROBE  (*(volatile uint8_t*)0x2582503D)
+
+static int  g_led_counter = 0;
+
 static bool saturn_transport_rx_ready(void* ctx)
 {
     return saturn_uart_rx_ready((saturn_uart16550_t*)ctx);
@@ -86,11 +106,48 @@ net_transport_t g_saturn_transport = {
 
 /*============================================================================
  * Network tick callback (runs every frame, all game states)
+ *
+ * After dnet_tick() completes all RX/TX processing, blinks the NetLink
+ * modem's front-panel LED via the board control register (0x25885031 bit 7).
+ * This uses the same hardware mechanism as Japanese XBAND games.
+ * Completely safe — board control register is independent of UART data path.
  *============================================================================*/
 
 void network_tick(void)
 {
     dnet_tick();
+
+    /* LED blink: only during online gameplay with modem present */
+    if (g_Game.gameState == GAME_STATE_GAMEPLAY &&
+        g_Game.isOnlineMode && g_modem_detected)
+    {
+        g_led_counter++;
+        if (g_led_counter >= 40)    /* period: 40 frames = ~0.67s = ~1.5 Hz */
+            g_led_counter = 0;
+
+        if (g_led_counter == 0) {
+            /* LED ON: read-modify-write, set bit 7 (matches DD 0x060406AE) */
+            uint8_t val = NETLINK_BOARD_CTRL;
+            NETLINK_BUS_STROBE = 0;
+            NETLINK_BOARD_CTRL = val | 0x80u;
+            NETLINK_BUS_STROBE = 0;
+        } else if (g_led_counter == 10) {
+            /* LED OFF: read-modify-write, clear bit 7 (matches DD 0x060406C2) */
+            uint8_t val = NETLINK_BOARD_CTRL;
+            NETLINK_BUS_STROBE = 0;
+            NETLINK_BOARD_CTRL = val & 0x7Fu;
+            NETLINK_BUS_STROBE = 0;
+        }
+    }
+    else if (g_led_counter != 0)
+    {
+        /* Transitioning out of gameplay — ensure LED is off */
+        uint8_t val = NETLINK_BOARD_CTRL;
+        NETLINK_BUS_STROBE = 0;
+        NETLINK_BOARD_CTRL = val & 0x7Fu;
+        NETLINK_BUS_STROBE = 0;
+        g_led_counter = 0;
+    }
 }
 
 // global callbacks, not tied to a specific game state
