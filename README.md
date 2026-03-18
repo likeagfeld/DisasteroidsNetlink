@@ -59,13 +59,22 @@ If you don't have a DreamPi, you can connect a USB modem directly to a PC and us
 
 1. Connect a Hayes-compatible USB modem to your PC
 2. Connect the modem to the Saturn NetLink via phone cable
+
+**Windows (easy):**
+
+3. Double-click `tools/netlink_bridge/start_bridge.bat`
+4. It will auto-install pyserial if needed, list your COM ports, and prompt you to pick your modem
+5. That's it — the bridge connects to the Disasteroids server automatically
+
+**Linux / macOS / manual:**
+
 3. Run the bridge:
    ```bash
    cd tools/netlink_bridge
-   python bridge.py --port /dev/ttyUSB0 --host saturncoup.duckdns.org --server-port 4822
+   python bridge.py --serial-port /dev/ttyUSB0 --server saturncoup.duckdns.org:4822 --secret "SaturnDisasteroids2026!NetLink#Key"
    ```
-   On Windows, replace `/dev/ttyUSB0` with your COM port (e.g., `COM3`).
-4. The bridge listens for the Saturn's dial-out, answers the call, and tunnels data to the game server over TCP.
+
+The bridge listens for the Saturn's dial-out, answers the call, and tunnels data to the game server over TCP.
 
 ### Server Setup
 

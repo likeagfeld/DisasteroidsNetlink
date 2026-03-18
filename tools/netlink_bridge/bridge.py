@@ -34,7 +34,7 @@ DEFAULT_BAUD = 9600
 DEFAULT_SERVER = "localhost:4821"
 DEFAULT_MOCK_PORT = 2337
 
-# Shared secret authentication
+# Shared secret authentication (default; override with --secret)
 SHARED_SECRET = b"SaturnCoup2025!NetLink#SecretKey"
 AUTH_MAGIC = b"AUTH"
 AUTH_OK = 0x01
@@ -857,10 +857,18 @@ def main() -> None:
         help="Log decoded SNCP frames for all relayed data",
     )
     parser.add_argument(
+        "--secret",
+        help="Shared secret for server authentication (overrides built-in default)",
+    )
+    parser.add_argument(
         "--list-ports", action="store_true",
         help="List available serial ports and exit",
     )
     args = parser.parse_args()
+
+    if args.secret:
+        global SHARED_SECRET
+        SHARED_SECRET = args.secret.encode("utf-8")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
