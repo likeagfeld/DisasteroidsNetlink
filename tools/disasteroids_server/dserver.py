@@ -1861,6 +1861,9 @@ class DisasteroidsServer:
             self._broadcast_to_game(msg)
             self.game_active = False
             log.info("Game over! Winner=%d", winner)
+            # Update leaderboard BEFORE resetting in_game flags,
+            # because _update_leaderboard checks c.in_game to find participants
+            self._update_leaderboard(winner)
             # Reset player states
             for s, c in self.clients.items():
                 if c.in_game:
@@ -1871,7 +1874,6 @@ class DisasteroidsServer:
                 bot.in_game = False
                 bot.ready = True  # Bots auto-ready for next game
             self._broadcast_lobby_state()
-            self._update_leaderboard(winner)
             self._broadcast_leaderboard()
 
     def _broadcast_to_game(self, msg: bytes):

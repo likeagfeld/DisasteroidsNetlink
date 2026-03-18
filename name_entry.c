@@ -44,6 +44,7 @@ static char g_name_buf[DNET_MAX_NAME + 1];
 static int g_name_len;
 static int g_cursor_row;
 static int g_cursor_col;
+static int g_bkp_load_status;  /* 0=no attempt, 1=loaded, 2=mount fail, 3=not found, 4=read fail */
 
 /*============================================================================
  * Helpers
@@ -78,19 +79,28 @@ static char getGridChar(int row, int col)
 void nameEntry_init(void)
 {
     /* Load saved name from backup RAM if no name set yet */
+    g_bkp_load_status = 0;
     if (g_Game.playerName[0] == '\0') {
-        jo_backup_mount(JoInternalMemoryBackup);
-        if (jo_backup_file_exists(JoInternalMemoryBackup, "DISAST_NAME")) {
-            unsigned int blen = 0;
-            void* data = jo_backup_load_file_contents(
-                JoInternalMemoryBackup, "DISAST_NAME", &blen);
-            if (data && blen > 0 && blen <= DNET_MAX_NAME + 1) {
-                memcpy(g_Game.playerName, data, blen);
-                g_Game.playerName[DNET_MAX_NAME] = '\0';
+        if (jo_backup_mount(JoInternalMemoryBackup)) {
+            if (jo_backup_file_exists(JoInternalMemoryBackup, "DISAST_NAME")) {
+                unsigned int blen = 0;
+                void* data = jo_backup_load_file_contents(
+                    JoInternalMemoryBackup, "DISAST_NAME", &blen);
+                if (data && blen > 0 && blen <= DNET_MAX_NAME + 1) {
+                    memcpy(g_Game.playerName, data, blen);
+                    g_Game.playerName[DNET_MAX_NAME] = '\0';
+                    g_bkp_load_status = 1; /* loaded OK */
+                } else {
+                    g_bkp_load_status = 4; /* read failed */
+                }
+                if (data) jo_free(data);
+            } else {
+                g_bkp_load_status = 3; /* file not found */
             }
-            if (data) jo_free(data);
+            jo_backup_unmount(JoInternalMemoryBackup);
+        } else {
+            g_bkp_load_status = 2; /* mount failed */
         }
-        jo_backup_unmount(JoInternalMemoryBackup);
     }
 
     /* Pre-populate with previous name if available */
@@ -194,17 +204,19 @@ void nameEntry_input(void)
                         g_Game.playerName[i] = g_name_buf[i];
                     g_Game.playerName[g_name_len] = '\0';
 
-                    /* Save name to backup RAM for persistence across power cycles */
+                    /* Save name to backup RAM for persistence across power cycles.
+                     * Jo Engine uses BUP_Write with overwrite flag, no need to
+                     * delete first (matches official demo pattern). */
                     {
                         static char bkp_fname[] = "DISAST_NAME";
                         static char bkp_comment[] = "Name";
-                        jo_backup_mount(JoInternalMemoryBackup);
-                        if (jo_backup_file_exists(JoInternalMemoryBackup, bkp_fname))
-                            jo_backup_delete_file(JoInternalMemoryBackup, bkp_fname);
-                        jo_backup_save_file_contents(JoInternalMemoryBackup, bkp_fname,
-                                                     bkp_comment, g_Game.playerName,
-                                                     (unsigned int)(g_name_len + 1));
-                        jo_backup_unmount(JoInternalMemoryBackup);
+                        if (jo_backup_mount(JoInternalMemoryBackup)) {
+                            jo_backup_save_file_contents(
+                                JoInternalMemoryBackup, bkp_fname,
+                                bkp_comment, g_Game.playerName,
+                                (unsigned int)(g_name_len + 1));
+                            jo_backup_unmount(JoInternalMemoryBackup);
+                        }
                     }
 
                     /* Check for second controller (port 1=multitap, port 6=Port B) */
@@ -380,10 +392,16 @@ void nameEntry_draw(void)
         jo_printf(1, 26, "A/C:Select  B:Cancel        ");
     }
 
-    /* Second controller notice */
+    /* Second controller notice / backup RAM status */
     if (getP2Port() >= 0) {
         jo_printf(1, 27, "2P controller detected!");
+    } else if (g_bkp_load_status > 0) {
+        static const char* bkp_msgs[] = {
+            "", "Save loaded OK", "BKP mount fail",
+            "No save found", "BKP read fail"
+        };
+        jo_printf(1, 27, "%-25s", bkp_msgs[g_bkp_load_status]);
     } else {
-        jo_printf(1, 27, "                       ");
+        jo_printf(1, 27, "                         ");
     }
 }
