@@ -300,9 +300,20 @@ class ModemHandler:
                 time.sleep(0.05)
         return buf.decode("ascii", errors="replace").strip()
 
+    def drain_serial(self) -> None:
+        """Discard all pending data in the serial input buffer."""
+        if self._serial:
+            try:
+                self._serial.reset_input_buffer()
+            except Exception:
+                pass
+
     def init_modem(self) -> None:
         """Send initialization AT commands."""
         log.info("Initializing modem...")
+
+        # Drain any stale data before sending commands
+        self.drain_serial()
 
         resp = self._send_at("ATZ", timeout=5.0)
         log.info("ATZ -> %s", resp.replace("\r\n", " ").strip())
@@ -327,6 +338,14 @@ class ModemHandler:
 
         log.info("Modem initialized, waiting for call...")
 
+    def check_alive(self) -> bool:
+        """Send AT to verify the modem is still responsive."""
+        try:
+            resp = self._send_at("AT", timeout=3.0)
+            return "OK" in resp
+        except Exception:
+            return False
+
     def wait_for_connect(self) -> bool:
         """
         Block until CONNECT is received from the modem.
@@ -344,6 +363,7 @@ class ModemHandler:
             return self._wait_direct()
 
         buf = b""
+        last_keepalive = time.time()
         while True:
             n = self._serial.in_waiting
             if n:
@@ -384,8 +404,25 @@ class ModemHandler:
                 if "NO CARRIER" in text or "ERROR" in text:
                     log.warning("Modem error during wait: %s", text.strip())
                     return False
+
+                # Keep buffer from growing indefinitely
+                if len(buf) > 4096:
+                    buf = buf[-256:]
             else:
                 time.sleep(0.1)
+
+                # Periodic keepalive: every 5 minutes, send AT to keep USB
+                # serial port alive and verify modem is still responsive.
+                # This prevents USB auto-suspend from killing the port.
+                now = time.time()
+                if now - last_keepalive >= 300.0:
+                    last_keepalive = now
+                    log.debug("Keepalive: checking modem with AT...")
+                    if not self.check_alive():
+                        log.warning("Modem not responding to keepalive AT!")
+                        return False
+                    # Re-drain and reset buffer after AT/OK exchange
+                    buf = b""
 
     def _wait_direct(self) -> bool:
         """
@@ -680,16 +717,28 @@ class NetlinkBridge:
             self.modem.init_modem()
 
             while self._running:
-                log.info("Waiting for incoming call...")
+                log.info("<listening>")
                 if not self.modem.wait_for_connect():
-                    log.warning("wait_for_connect failed, retrying in 2s...")
+                    log.warning("wait_for_connect failed, re-initializing modem...")
                     time.sleep(2)
+                    # Re-init modem: resets all registers, clears stale state,
+                    # and re-enables auto-answer. This fixes the bug where the
+                    # modem stops responding to RING after long idle periods.
+                    try:
+                        self.modem.init_modem()
+                    except Exception as e:
+                        log.error("Modem re-init failed: %s — reopening port", e)
+                        self.modem.close()
+                        time.sleep(2)
+                        self.modem.open()
+                        self.modem.init_modem()
                     continue
 
                 if not self.connect_to_server():
                     log.error("Cannot reach server, dropping modem connection")
                     self.modem.hangup()
                     time.sleep(2)
+                    self.modem.init_modem()
                     continue
 
                 self._modem_logger.reset()
@@ -702,13 +751,25 @@ class NetlinkBridge:
                 self._modem_tail = b""
 
                 if reason == "no_carrier":
-                    log.info("Saturn disconnected, returning to wait...")
+                    log.info("Saturn disconnected, re-initializing modem...")
                 elif reason == "server_closed":
                     log.warning("Server closed connection, hanging up modem")
                     self.modem.hangup()
                 else:
                     log.warning("Relay error, retrying...")
                     time.sleep(1)
+
+                # Always re-initialize the modem between sessions.
+                # This restores S-registers (ATS0=1 for auto-answer),
+                # drains stale serial data, and keeps the USB port awake.
+                try:
+                    self.modem.init_modem()
+                except Exception as e:
+                    log.error("Modem re-init failed: %s — reopening port", e)
+                    self.modem.close()
+                    time.sleep(2)
+                    self.modem.open()
+                    self.modem.init_modem()
 
         except KeyboardInterrupt:
             log.info("Shutting down (keyboard interrupt)")

@@ -89,6 +89,12 @@ void dnet_log(const char* msg)
         g_net.log_count++;
 }
 
+void dnet_clear_log(void)
+{
+    memset(g_net.log_lines, 0, sizeof(g_net.log_lines));
+    g_net.log_count = 0;
+}
+
 /*============================================================================
  * State Transitions
  *============================================================================*/
@@ -237,6 +243,8 @@ static void process_game_start(const uint8_t* payload, int len)
         return;
     }
 
+    g_net.has_last_results = false;
+
     g_net.state = DNET_STATE_PLAYING;
     g_net.status_msg = "Playing";
     g_net.local_frame = 0;
@@ -255,6 +263,10 @@ static void process_game_start(const uint8_t* payload, int len)
     /* Clear lobby roster — server will resend via PLAYER_JOIN with game IDs */
     memset(g_net.lobby_players, 0, sizeof(g_net.lobby_players));
     g_net.lobby_count = 0;
+
+    /* Clear game roster — PLAYER_JOIN messages will populate it */
+    memset(g_net.game_roster, 0, sizeof(g_net.game_roster));
+    g_net.game_roster_count = 0;
 
     dnet_log("Game starting!");
 }
@@ -289,10 +301,15 @@ static void process_input_relay(const uint8_t* payload, int len)
 
 static void process_game_over(const uint8_t* payload, int len)
 {
-    (void)payload;
-    (void)len;
-
     dnet_log("Game Over!");
+
+    /* Parse winner ID from payload */
+    if (len >= 2) {
+        g_net.last_winner_id = payload[1];
+    } else {
+        g_net.last_winner_id = 0xFF;
+    }
+    g_net.has_last_results = true;
 
     /* Trigger game over state — countdown then return to lobby */
     g_Game.isGameOver = true;
@@ -390,6 +407,12 @@ static void process_ship_sync(const uint8_t* payload, int len)
             player->curPos.x += dx_pos - (dx_pos >> 2);
             player->curPos.y += dy_pos - (dy_pos >> 2);
         }
+
+        /* Extrapolate: predict where the ship will be ~3 frames from now.
+         * This offsets the inherent staleness of the sync'd position.
+         * 3 frames = half the sync interval, balancing freshness vs overshoot. */
+        player->curPos.x += player->curPos.dx * 3;
+        player->curPos.y += player->curPos.dy * 3;
     }
 }
 
@@ -526,6 +549,32 @@ static void process_player_spawn(const uint8_t* payload, int len)
     spawnPlayerFromServer(pid, angle, invuln);
 }
 
+static void process_leaderboard(const uint8_t* payload, int len)
+{
+    int off, i, nlen, copy;
+
+    /* [type:1][count:1]{name_len:1, name:N, wins:2BE, best:2BE, gp:2BE}... */
+    if (len < 2) return;
+
+    g_net.leaderboard_count = payload[1];
+    if (g_net.leaderboard_count > DNET_LEADERBOARD_MAX)
+        g_net.leaderboard_count = DNET_LEADERBOARD_MAX;
+
+    off = 2;
+    for (i = 0; i < g_net.leaderboard_count && off < len; i++) {
+        if (off >= len) break;
+        nlen = payload[off++];
+        copy = (nlen < DNET_MAX_NAME) ? nlen : DNET_MAX_NAME;
+        if (off + nlen + 6 > len) { g_net.leaderboard_count = i; break; }
+        memcpy(g_net.leaderboard[i].name, &payload[off], copy);
+        g_net.leaderboard[i].name[copy] = '\0';
+        off += nlen;
+        g_net.leaderboard[i].wins = read_u16(&payload[off]); off += 2;
+        g_net.leaderboard[i].best_score = read_u16(&payload[off]); off += 2;
+        g_net.leaderboard[i].games_played = read_u16(&payload[off]); off += 2;
+    }
+}
+
 static void process_message(const uint8_t* payload, int len)
 {
     uint8_t msg_type;
@@ -602,7 +651,7 @@ static void process_message(const uint8_t* payload, int len)
         if (len >= 2) {
             uint8_t pid = payload[1];
             int slot;
-            /* Find existing slot or first inactive slot */
+            /* Find existing slot or first inactive slot in lobby_players */
             int target = -1;
             for (slot = 0; slot < DNET_MAX_PLAYERS; slot++) {
                 if (g_net.lobby_players[slot].active &&
@@ -629,6 +678,36 @@ static void process_message(const uint8_t* payload, int len)
                 }
                 if (target >= g_net.lobby_count)
                     g_net.lobby_count = target + 1;
+            }
+
+            /* Also store in game_roster (survives LOBBY_STATE overwrites).
+             * This is used by the results screen after game-over. */
+            {
+                int rt = -1;
+                for (slot = 0; slot < DNET_MAX_PLAYERS; slot++) {
+                    if (g_net.game_roster[slot].active &&
+                        g_net.game_roster[slot].id == pid) {
+                        rt = slot; break;
+                    }
+                }
+                if (rt < 0) {
+                    for (slot = 0; slot < DNET_MAX_PLAYERS; slot++) {
+                        if (!g_net.game_roster[slot].active) {
+                            rt = slot; break;
+                        }
+                    }
+                }
+                if (rt >= 0) {
+                    g_net.game_roster[rt].id = pid;
+                    g_net.game_roster[rt].active = true;
+                    if (len >= 3) {
+                        dnet_read_string(&payload[2], len - 2,
+                                         g_net.game_roster[rt].name,
+                                         DNET_MAX_NAME + 1);
+                    }
+                    if (rt >= g_net.game_roster_count)
+                        g_net.game_roster_count = rt + 1;
+                }
             }
         }
         if (g_net.state == DNET_STATE_LOBBY)
@@ -670,6 +749,10 @@ static void process_message(const uint8_t* payload, int len)
             g_Game.myPlayerID2 = payload[1];
             dnet_log("Player 2 joined!");
         }
+        break;
+
+    case DNET_MSG_LEADERBOARD_DATA:
+        process_leaderboard(payload, len);
         break;
 
     default:
@@ -809,9 +892,9 @@ void dnet_send_ship_state(void)
 
     if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
 
-    /* Throttle to every 5 frames (~12fps) for smoother remote rendering */
+    /* Throttle to every 4 frames (~15fps) for smoother remote rendering */
     g_net.ship_state_cooldown++;
-    if (g_net.ship_state_cooldown < 5) return;
+    if (g_net.ship_state_cooldown < 4) return;
     g_net.ship_state_cooldown = 0;
 
     player = &g_Players[g_net.my_player_id];
@@ -910,9 +993,9 @@ void dnet_send_ship_state_p2(void)
     if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
     if (g_Game.myPlayerID2 == 0xFF) return;
 
-    /* Throttle to every 5 frames (~12fps) for smoother remote rendering */
+    /* Throttle to every 4 frames (~15fps) for smoother remote rendering */
     g_net.ship_state_cooldown_p2++;
-    if (g_net.ship_state_cooldown_p2 < 5) return;
+    if (g_net.ship_state_cooldown_p2 < 4) return;
     g_net.ship_state_cooldown_p2 = 0;
 
     player = &g_Players[g_Game.myPlayerID2];
@@ -932,6 +1015,14 @@ void dnet_send_ship_state_p2(void)
         (int32_t)player->curPos.dy,
         (int16_t)player->curPos.rot,
         flags);
+    net_transport_send(g_net.transport, g_net.tx_buf, len);
+}
+
+void dnet_request_leaderboard(void)
+{
+    int len;
+    if (g_net.state != DNET_STATE_LOBBY || !g_net.transport) return;
+    len = dnet_encode_leaderboard_req(g_net.tx_buf);
     net_transport_send(g_net.transport, g_net.tx_buf, len);
 }
 

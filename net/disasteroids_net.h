@@ -27,6 +27,7 @@
 #define DNET_AUTH_MAX_RETRIES   5
 #define DNET_MAX_PACKETS_FRAME  24   /* Max packets to process per frame (11 opponents + overhead) */
 #define DNET_INPUT_BUFFER_PER_PLAYER 8  /* Frames of input to buffer per player */
+#define DNET_LEADERBOARD_MAX   10    /* Max leaderboard entries */
 
 /*============================================================================
  * Network State Machine
@@ -52,6 +53,27 @@ typedef struct {
     bool    ready;
     bool    active;
 } dnet_lobby_player_t;
+
+/*============================================================================
+ * Game Roster (survives lobby state transition for results screen)
+ *============================================================================*/
+
+typedef struct {
+    uint8_t id;                       /* game_player_id */
+    char    name[DNET_MAX_NAME + 1];
+    bool    active;
+} dnet_roster_entry_t;
+
+/*============================================================================
+ * Leaderboard Entry
+ *============================================================================*/
+
+typedef struct {
+    char     name[DNET_MAX_NAME + 1];
+    uint16_t wins;
+    uint16_t best_score;
+    uint16_t games_played;
+} dnet_leaderboard_entry_t;
 
 /*============================================================================
  * Remote Input Buffer
@@ -99,6 +121,10 @@ typedef struct {
     int lobby_count;
     bool my_ready;
 
+    /* Game roster (populated from PLAYER_JOIN, survives game-over for results screen) */
+    dnet_roster_entry_t game_roster[DNET_MAX_PLAYERS];
+    int game_roster_count;
+
     /* Game config (from server GAME_START) */
     uint32_t game_seed;
     uint8_t  game_type;
@@ -139,6 +165,14 @@ typedef struct {
     /* Log messages for display */
     char log_lines[4][40];
     int  log_count;
+
+    /* Last game winner */
+    uint8_t last_winner_id;    /* Player ID of last game's winner (0xFF = none/coop) */
+    bool    has_last_results;  /* True if we have results from a completed game */
+
+    /* Online leaderboard (from server) */
+    dnet_leaderboard_entry_t leaderboard[DNET_LEADERBOARD_MAX];
+    int leaderboard_count;
 
 } dnet_state_data_t;
 
@@ -237,5 +271,11 @@ void dnet_send_input_delta_p2(uint16_t frame_num, uint16_t input_bits);
 
 /** Send ship state for second local player. */
 void dnet_send_ship_state_p2(void);
+
+/** Clear log lines (call when entering lobby to remove stale text). */
+void dnet_clear_log(void);
+
+/** Request leaderboard data from server. */
+void dnet_request_leaderboard(void);
 
 #endif /* DISASTEROIDS_NET_H */

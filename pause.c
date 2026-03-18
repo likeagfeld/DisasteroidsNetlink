@@ -397,14 +397,15 @@ static void drawPauseScoreShip(jo_3d_mesh* mesh, int xPos, int yPos, int color)
     jo_3d_pop_matrix();
 }
 
-// look up a player name by ID from lobby data
+// look up a player name by game_player_id from game roster
+// (game_roster survives lobby state transitions, unlike lobby_players)
 static const char* getOnlinePlayerName(int id)
 {
     const dnet_state_data_t* nd = dnet_get_data();
     int i;
-    for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
-        if (nd->lobby_players[i].id == (uint8_t)id)
-            return nd->lobby_players[i].name;
+    for (i = 0; i < nd->game_roster_count && i < DNET_MAX_PLAYERS; i++) {
+        if (nd->game_roster[i].active && nd->game_roster[i].id == (uint8_t)id)
+            return nd->game_roster[i].name;
     }
     return "";
 }

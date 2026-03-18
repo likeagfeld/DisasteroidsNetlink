@@ -70,10 +70,13 @@ void initPlayers(void)
             continue;
         }
 
-        // check if the player already had a color
-        // this is annoying, but allows the player to have keep the same
-        // color between multiple games
-        if(color == 0)
+        // Assign player color
+        if(g_Game.isOnlineMode)
+        {
+            // Online: deterministic color by player ID so all Saturns agree
+            player->color = g_Assets.hudColors[i % MAX_PLAYERS];
+        }
+        else if(color == 0)
         {
             player->color = popPlayerColor();
         }

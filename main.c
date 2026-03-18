@@ -233,9 +233,11 @@ void abcStart_callback(void)
 }
 
 // check if player 1 pressed Y to change the HUD
-// this can occur at any time
+// this can occur at any time (except lobby, where Y=disconnect)
 void changeHud_input(void)
 {
+    if (g_Game.gameState == GAME_STATE_LOBBY) return;
+
     // player 1 press start
     if (jo_is_pad1_key_pressed(JO_KEY_Y))
     {
@@ -252,9 +254,11 @@ void changeHud_input(void)
 }
 
 // check if player 1 pressed Z to change the debug level
-// this can occur at any time
+// this can occur at any time (except lobby, where Z = stats overlay)
 void debug_input(void)
 {
+    if (g_Game.gameState == GAME_STATE_LOBBY) return;
+
     // player 1 press start
     if (jo_is_pad1_key_pressed(JO_KEY_Z))
     {

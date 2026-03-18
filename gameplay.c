@@ -314,15 +314,17 @@ static void applyInputBitsToPlayer(PPLAYER player, uint16_t bits, bool isLocal)
     if(player->objectState != OBJECT_STATE_ACTIVE) return;
     if(player->respawnFrames > 0) return;
 
-    // Color change
-    if (bits & DNET_INPUT_X) {
-        if(player->input.pressedX == false) {
-            pushPlayerColor(player->color);
-            player->color = popPlayerColor();
+    // Color change (offline only — online colors are fixed by player ID)
+    if (!g_Game.isOnlineMode) {
+        if (bits & DNET_INPUT_X) {
+            if(player->input.pressedX == false) {
+                pushPlayerColor(player->color);
+                player->color = popPlayerColor();
+            }
+            player->input.pressedX = true;
+        } else {
+            player->input.pressedX = false;
         }
-        player->input.pressedX = true;
-    } else {
-        player->input.pressedX = false;
     }
 
     // Rotation — local only. Remote rotation comes from SHIP_SYNC.

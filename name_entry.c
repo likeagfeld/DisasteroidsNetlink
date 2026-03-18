@@ -11,6 +11,7 @@
 #include "name_entry.h"
 #include "assets/assets.h"
 #include "objects/star.h"
+#include "net/disasteroids_net.h"
 
 /*============================================================================
  * Character Grid Layout
@@ -76,6 +77,22 @@ static char getGridChar(int row, int col)
 
 void nameEntry_init(void)
 {
+    /* Load saved name from backup RAM if no name set yet */
+    if (g_Game.playerName[0] == '\0') {
+        jo_backup_mount(JoInternalMemoryBackup);
+        if (jo_backup_file_exists(JoInternalMemoryBackup, "DISAST_NAME")) {
+            unsigned int blen = 0;
+            void* data = jo_backup_load_file_contents(
+                JoInternalMemoryBackup, "DISAST_NAME", &blen);
+            if (data && blen > 0 && blen <= DNET_MAX_NAME + 1) {
+                memcpy(g_Game.playerName, data, blen);
+                g_Game.playerName[DNET_MAX_NAME] = '\0';
+            }
+            if (data) jo_free(data);
+        }
+        jo_backup_unmount(JoInternalMemoryBackup);
+    }
+
     /* Pre-populate with previous name if available */
     if (g_Game.playerName[0] != '\0') {
         int i;
@@ -93,6 +110,17 @@ void nameEntry_init(void)
     g_cursor_col = 0;
 
     initStars();
+
+    /* Fix "A" append bug: force all input flags to "pressed" so the first
+     * frame treats any held buttons as already-pressed (no edge trigger).
+     * This prevents carry-over from the title screen's A-button press. */
+    g_Game.input.pressedAC = true;
+    g_Game.input.pressedB = true;
+    g_Game.input.pressedStart = true;
+    g_Game.input.pressedUp = true;
+    g_Game.input.pressedDown = true;
+    g_Game.input.pressedLeft = true;
+    g_Game.input.pressedRight = true;
 }
 
 void nameEntry_input(void)
@@ -165,6 +193,19 @@ void nameEntry_input(void)
                     for (i = 0; i < g_name_len; i++)
                         g_Game.playerName[i] = g_name_buf[i];
                     g_Game.playerName[g_name_len] = '\0';
+
+                    /* Save name to backup RAM for persistence across power cycles */
+                    {
+                        static char bkp_fname[] = "DISAST_NAME";
+                        static char bkp_comment[] = "Name";
+                        jo_backup_mount(JoInternalMemoryBackup);
+                        if (jo_backup_file_exists(JoInternalMemoryBackup, bkp_fname))
+                            jo_backup_delete_file(JoInternalMemoryBackup, bkp_fname);
+                        jo_backup_save_file_contents(JoInternalMemoryBackup, bkp_fname,
+                                                     bkp_comment, g_Game.playerName,
+                                                     (unsigned int)(g_name_len + 1));
+                        jo_backup_unmount(JoInternalMemoryBackup);
+                    }
 
                     /* Check for second controller (port 1=multitap, port 6=Port B) */
                     g_Game.hasSecondLocal = (getP2Port() >= 0) ? true : false;

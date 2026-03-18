@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -78,6 +79,7 @@ DNET_MSG_ADD_BOT = 0x17
 DNET_MSG_REMOVE_BOT = 0x18
 DNET_MSG_REMOVE_LOCAL_PLAYER = 0x19
 DNET_MSG_SHIP_ASTEROID_HIT = 0x1A
+DNET_MSG_LEADERBOARD_REQ = 0x1B
 
 # Disasteroids Messages — Server -> Client
 DNET_MSG_LOBBY_STATE = 0xA0
@@ -96,6 +98,7 @@ DNET_MSG_WAVE_EVENT = 0xAC
 DNET_MSG_PLAYER_KILL = 0xAD
 DNET_MSG_PLAYER_SPAWN = 0xAE
 DNET_MSG_LOCAL_PLAYER_ACK = 0x86
+DNET_MSG_LEADERBOARD_DATA = 0xAF
 
 # Game types (matching Disasteroids GAME_TYPE enum)
 GAME_TYPE_COOP = 0
@@ -232,6 +235,20 @@ def build_game_over(winner_id: int) -> bytes:
     return encode_frame(bytes([DNET_MSG_GAME_OVER, winner_id]))
 
 
+def build_leaderboard_data(entries: list) -> bytes:
+    """Build LEADERBOARD_DATA message. entries = list of dicts with name,wins,best_score,games_played."""
+    count = min(len(entries), 10)
+    payload = bytes([DNET_MSG_LEADERBOARD_DATA, count])
+    for e in entries[:count]:
+        name_bytes = e["name"].encode("utf-8")[:16]
+        payload += struct.pack("B", len(name_bytes)) + name_bytes
+        payload += struct.pack("!HHH",
+                               min(e.get("wins", 0), 65535),
+                               min(e.get("best_score", 0), 65535),
+                               min(e.get("games_played", 0), 65535))
+    return encode_frame(payload)
+
+
 def build_log(text: str) -> bytes:
     raw = text.encode("utf-8")[:255]
     payload = bytes([DNET_MSG_LOG, len(raw)]) + raw
@@ -359,6 +376,7 @@ class GameSimulation:
         self.num_lives = num_lives
         self.num_players = num_players
         self.game_over = False
+        self.scores = {}  # player_id -> int (asteroid kill count)
 
     def init_player(self, player_id: int):
         """Register a player for collision tracking."""
@@ -578,7 +596,10 @@ class GameSimulation:
         a = self.asteroids[slot]
         if a is None or not a["alive"]:
             return None
-        return self._destroy_asteroid(slot, scorer_id)
+        result = self._destroy_asteroid(slot, scorer_id)
+        if result is not None and scorer_id != 0xFF and scorer_id < MAX_PLAYERS:
+            self.scores[scorer_id] = self.scores.get(scorer_id, 0) + 1
+        return result
 
     def _destroy_asteroid(self, slot: int, scorer_id: int):
         """Destroy asteroid, generate split data. Returns event tuple."""
@@ -919,6 +940,11 @@ class DisasteroidsServer:
             name = BOT_NAMES[i % len(BOT_NAMES)]
             self.bots.append(BotPlayer(name, i, BOT_DIFFICULTY_DEFAULT))
 
+        # Leaderboard persistence
+        self.leaderboard = {}  # {name: {"wins": N, "best_score": N, "games_played": N}}
+        self._leaderboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leaderboard.json")
+        self._load_leaderboard()
+
         # Delta compression: track last relayed input per player_id
         self.last_relayed_input = {}   # {player_id: input_bits}
         self.relay_cooldown = {}       # {player_id: frames_since_relay}
@@ -926,6 +952,104 @@ class DisasteroidsServer:
         # Tick timer for game simulation
         self._last_tick = 0.0
         self._tick_interval = 1.0 / GameSimulation.TICK_RATE
+
+    def _load_leaderboard(self):
+        """Load leaderboard from disk."""
+        try:
+            if os.path.exists(self._leaderboard_path):
+                with open(self._leaderboard_path, "r") as f:
+                    data = json.load(f)
+                self.leaderboard = data.get("players", {})
+                log.info("Loaded leaderboard: %d players", len(self.leaderboard))
+        except Exception as e:
+            log.warning("Failed to load leaderboard: %s", e)
+            self.leaderboard = {}
+
+    def _save_leaderboard(self):
+        """Save leaderboard to disk."""
+        try:
+            with open(self._leaderboard_path, "w") as f:
+                json.dump({"players": self.leaderboard}, f, indent=2)
+        except Exception as e:
+            log.warning("Failed to save leaderboard: %s", e)
+
+    def _update_leaderboard(self, winner_id):
+        """Update leaderboard after a game ends."""
+        if not self.sim:
+            return
+
+        # Build name -> score mapping from game roster
+        game_players = {}  # name -> score
+        for c in self.clients.values():
+            if c.in_game and c.game_player_id is not None:
+                score = self.sim.scores.get(c.game_player_id, 0)
+                game_players[c.username] = score
+                # Also count local players
+                for i, lp_id in enumerate(c.local_player_ids):
+                    ln = c.local_player_names[i] if i < len(c.local_player_names) else "P2"
+                    game_players[ln] = self.sim.scores.get(lp_id, 0)
+        for bot in self.bots:
+            if bot.in_game and bot.game_player_id is not None:
+                game_players[bot.name] = self.sim.scores.get(bot.game_player_id, 0)
+
+        # Find winner name
+        winner_name = None
+        if winner_id != 0xFF:
+            for c in self.clients.values():
+                if c.game_player_id == winner_id:
+                    winner_name = c.username
+                    break
+                if winner_id in c.local_player_ids:
+                    idx = c.local_player_ids.index(winner_id)
+                    if idx < len(c.local_player_names):
+                        winner_name = c.local_player_names[idx]
+                    break
+            if not winner_name:
+                for bot in self.bots:
+                    if bot.game_player_id == winner_id:
+                        winner_name = bot.name
+                        break
+
+        # Update each participant
+        for name, score in game_players.items():
+            if name not in self.leaderboard:
+                self.leaderboard[name] = {"wins": 0, "best_score": 0, "games_played": 0}
+            entry = self.leaderboard[name]
+            entry["games_played"] += 1
+            if score > entry["best_score"]:
+                entry["best_score"] = score
+            if winner_name and name == winner_name:
+                entry["wins"] += 1
+
+        self._save_leaderboard()
+        log.info("Leaderboard updated: %d total players", len(self.leaderboard))
+
+    def _get_leaderboard_top10(self) -> list:
+        """Get top 10 leaderboard entries sorted by wins (tiebreak: best_score)."""
+        entries = []
+        for name, data in self.leaderboard.items():
+            entries.append({
+                "name": name,
+                "wins": data["wins"],
+                "best_score": data["best_score"],
+                "games_played": data["games_played"],
+            })
+        entries.sort(key=lambda e: (e["wins"], e["best_score"]), reverse=True)
+        return entries[:10]
+
+    def _send_leaderboard_to_client(self, client):
+        """Send current leaderboard to a specific client."""
+        entries = self._get_leaderboard_top10()
+        msg = build_leaderboard_data(entries)
+        client.send_raw(msg)
+
+    def _broadcast_leaderboard(self):
+        """Send leaderboard to all authenticated clients."""
+        entries = self._get_leaderboard_top10()
+        msg = build_leaderboard_data(entries)
+        for c in self.clients.values():
+            if c.authenticated:
+                c.send_raw(msg)
 
     def _next_user_id(self) -> int:
         """Find lowest available user_id (1-based), recycling disconnected IDs."""
@@ -1134,6 +1258,8 @@ class DisasteroidsServer:
             self._handle_remove_bot(sock, client, payload)
         elif msg_type == DNET_MSG_REMOVE_LOCAL_PLAYER:
             self._handle_remove_local_player(sock, client)
+        elif msg_type == DNET_MSG_LEADERBOARD_REQ:
+            self._send_leaderboard_to_client(client)
         else:
             log.debug("Unknown message type 0x%02X from %s",
                       msg_type, client.address)
@@ -1158,6 +1284,7 @@ class DisasteroidsServer:
             client.send_raw(build_welcome_back(
                 client.user_id, client.uuid, client.username))
             self._broadcast_lobby_state()
+            self._send_leaderboard_to_client(client)
         else:
             # New player — reuse UUID if this socket already got one
             # (handles duplicate CONNECT on same connection)
@@ -1211,6 +1338,7 @@ class DisasteroidsServer:
             client.send_raw(build_log("Game in progress - wait for next round"))
 
         self._broadcast_lobby_state()
+        self._send_leaderboard_to_client(client)
 
         # Announce join
         for s, c in self.clients.items():
@@ -1733,6 +1861,8 @@ class DisasteroidsServer:
                 bot.in_game = False
                 bot.ready = True  # Bots auto-ready for next game
             self._broadcast_lobby_state()
+            self._update_leaderboard(winner)
+            self._broadcast_leaderboard()
 
     def _broadcast_to_game(self, msg: bytes):
         """Send a message to all in-game clients."""

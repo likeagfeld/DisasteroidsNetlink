@@ -31,6 +31,11 @@ IF %ERRORLEVEL% NEQ 0 (
 ) ELSE (
     ECHO.
     ECHO === Build successful! ===
+    REM Regenerate CUE file to ensure audio tracks are included
+    IF EXIST game.iso (
+        JoEngineCueMaker.exe
+        ECHO === CUE file generated with audio tracks ===
+    )
 )
 
 ECHO.

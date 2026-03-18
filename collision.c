@@ -258,8 +258,12 @@ static void checkForDisasteroidPlayersCollision(PDISASTEROID disasteroid)
         // add two because we have variance in sizes
         radius = getDisasteroidRadiusSize(disasteroid->size) + 2;
 
-        result = checkForCircleCollision(toINT(disasteroid->curPos.x), toINT(disasteroid->curPos.y), radius,
-                                        toINT(player->curPos.x), toINT(player->curPos.y), PLAYER_SHIP_RADIUS);
+        {
+            int shipRadius = PLAYER_SHIP_RADIUS;
+            if(g_Game.isOnlineMode) shipRadius += 3; /* compensate for network position desync */
+            result = checkForCircleCollision(toINT(disasteroid->curPos.x), toINT(disasteroid->curPos.y), radius,
+                                            toINT(player->curPos.x), toINT(player->curPos.y), shipRadius);
+        }
         if(result != 0)
         {
             if(g_Game.isOnlineMode)
@@ -364,8 +368,12 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
             continue;
         }
 
-        result = checkForCircleCollision(toINT(player->curPos.x), toINT(player->curPos.y), PLAYER_SHIP_RADIUS,
-                                         toINT(projectile->curPos.x), toINT(projectile->curPos.y), PROJECTILE_RADIUS);
+        {
+            int shipRadius = PLAYER_SHIP_RADIUS;
+            if(g_Game.isOnlineMode) shipRadius += 3; /* compensate for network position desync */
+            result = checkForCircleCollision(toINT(player->curPos.x), toINT(player->curPos.y), shipRadius,
+                                             toINT(projectile->curPos.x), toINT(projectile->curPos.y), PROJECTILE_RADIUS);
+        }
         if(result != 0)
         {
             if(g_Game.gameType == GAME_TYPE_COOP)

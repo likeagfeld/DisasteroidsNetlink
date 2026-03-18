@@ -15,6 +15,7 @@ static jo_3d_mesh* createF(void);
 static jo_3d_mesh* createG(void);
 static jo_3d_mesh* createH(void);
 static jo_3d_mesh* createI(void);
+static jo_3d_mesh* createJ(void);
 static jo_3d_mesh* createK(void);
 static jo_3d_mesh* createL(void);
 static jo_3d_mesh* createM(void);
@@ -28,6 +29,7 @@ static jo_3d_mesh* createT(void);
 static jo_3d_mesh* createU(void);
 static jo_3d_mesh* createV(void);
 static jo_3d_mesh* createW(void);
+static jo_3d_mesh* createX(void);
 static jo_3d_mesh* createY(void);
 
 // digits 0-9
@@ -69,6 +71,7 @@ void loadAlphabet(void)
     g_Assets.letters[LETTER_TO_INDEX('G')] = createG();
     g_Assets.letters[LETTER_TO_INDEX('H')] = createH();
     g_Assets.letters[LETTER_TO_INDEX('I')] = createI();
+    g_Assets.letters[LETTER_TO_INDEX('J')] = createJ();
     g_Assets.letters[LETTER_TO_INDEX('K')] = createK();
     g_Assets.letters[LETTER_TO_INDEX('L')] = createL();
     g_Assets.letters[LETTER_TO_INDEX('M')] = createM();
@@ -82,6 +85,7 @@ void loadAlphabet(void)
     g_Assets.letters[LETTER_TO_INDEX('U')] = createU();
     g_Assets.letters[LETTER_TO_INDEX('V')] = createV();
     g_Assets.letters[LETTER_TO_INDEX('W')] = createW();
+    g_Assets.letters[LETTER_TO_INDEX('X')] = createX();
     g_Assets.letters[LETTER_TO_INDEX('Y')] = createY();
 }
 
@@ -226,6 +230,18 @@ static jo_3d_mesh* createI(void)
     QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
     QUAD_LINE_SEGMENT(mesh, 0, 4, 4, 4);
     QUAD_LINE_SEGMENT(mesh, 2, 0, 2, 4);
+
+    return mesh;
+}
+
+static jo_3d_mesh* createJ(void)
+{
+    jo_3d_mesh* mesh = jo_3d_create_mesh(3);
+    int verticeIndex = 0;
+
+    QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 1);
 
     return mesh;
 }
@@ -395,6 +411,29 @@ static jo_3d_mesh* createW(void)
     QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
     QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
     QUAD_LINE_SEGMENT(mesh, 2, 3, 2, 0)
+
+    return mesh;
+}
+
+static jo_3d_mesh* createX(void)
+{
+    jo_3d_mesh* mesh = jo_3d_create_mesh(7);
+    int verticeIndex = 0;
+
+    /* Stepped cross shape approximating X with H/V lines:
+     * |   |
+     *  | |
+     *  |-|
+     *  | |
+     * |   |
+     */
+    QUAD_LINE_SEGMENT(mesh, 0, 3, 0, 4);
+    QUAD_LINE_SEGMENT(mesh, 4, 3, 4, 4);
+    QUAD_LINE_SEGMENT(mesh, 1, 1, 1, 3);
+    QUAD_LINE_SEGMENT(mesh, 3, 1, 3, 3);
+    QUAD_LINE_SEGMENT(mesh, 1, 2, 3, 2);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 1);
+    QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 1);
 
     return mesh;
 }

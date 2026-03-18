@@ -52,6 +52,7 @@
 #define DNET_MSG_REMOVE_BOT        0x18  /* (no payload) */
 #define DNET_MSG_REMOVE_LOCAL_PLAYER 0x19 /* (no payload) - remove second local player */
 #define DNET_MSG_SHIP_ASTEROID_HIT 0x1A  /* [slot:1][player_id:1] local player hit asteroid */
+#define DNET_MSG_LEADERBOARD_REQ   0x1B  /* Client requests leaderboard (no payload) */
 
 /*============================================================================
  * Disasteroids Server -> Client Messages (0xA0 - 0xBF)
@@ -73,6 +74,7 @@
 #define DNET_MSG_PLAYER_KILL       0xAD  /* [player_id:1][lives:1][angle:2][invuln:2][respawn:2] */
 #define DNET_MSG_PLAYER_SPAWN      0xAE  /* [player_id:1][angle:2][invuln:2] */
 #define DNET_MSG_LOCAL_PLAYER_ACK  0x86  /* [player_id:1] */
+#define DNET_MSG_LEADERBOARD_DATA 0xAF  /* [count:1]{name_len:1,name:N,wins:2BE,best:2BE,gp:2BE}... */
 
 /*============================================================================
  * Input State Bitmask (matches Jo Engine key definitions)
@@ -416,6 +418,15 @@ static inline int dnet_encode_remove_local_player(uint8_t* buf)
     buf[0] = 0x00;
     buf[1] = 0x01;
     buf[2] = DNET_MSG_REMOVE_LOCAL_PLAYER;
+    return 3;
+}
+
+/** Encode LEADERBOARD_REQ: request server send leaderboard data. */
+static inline int dnet_encode_leaderboard_req(uint8_t* buf)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x01;
+    buf[2] = DNET_MSG_LEADERBOARD_REQ;
     return 3;
 }
 
