@@ -341,20 +341,11 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
         return;
     }
 
-    // In online mode, only check collision for local players.
-    // Remote player collisions would consume projectiles incorrectly.
-    if(g_Game.isOnlineMode)
-    {
-        bool isLocal = ((unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID);
-        if(g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2)
-            isLocal = true;
-        if(!isLocal)
-            return;
-    }
-
     // check if any of the projectiles collided with this player
     for(unsigned int k = 0; k < COUNTOF(g_Projectiles); k++)
     {
+        bool isLocal;
+
         projectile = &g_Projectiles[k];
 
         if(projectile->objectState != OBJECT_STATE_ACTIVE)
@@ -366,6 +357,22 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
         {
             // can't shoot yourself
             continue;
+        }
+
+        isLocal = ((unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID);
+        if(g_Game.hasSecondLocal && (unsigned int)player->playerID == (unsigned int)g_Game.myPlayerID2)
+            isLocal = true;
+
+        // In online mode: only check collision if either the target is local
+        // (my ship got hit) or the projectile is local (I shot someone).
+        // This prevents double-detection from multiple Saturns.
+        if(g_Game.isOnlineMode && !isLocal)
+        {
+            bool projIsLocal = ((unsigned int)projectile->playerID == (unsigned int)g_Game.myPlayerID);
+            if(g_Game.hasSecondLocal && (unsigned int)projectile->playerID == (unsigned int)g_Game.myPlayerID2)
+                projIsLocal = true;
+            if(!projIsLocal)
+                continue;
         }
 
         {
@@ -386,10 +393,17 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
             {
                 if(g_Game.isOnlineMode)
                 {
-                    // Online versus: notify server, cosmetic death locally
+                    // Online versus: notify server with target player_id
                     dnet_send_ship_asteroid_hit(0xFF, (uint8_t)player->playerID);
-                    destroyPlayer(player);  // cosmetic only
-                    player->respawnFrames = 60;  // hide while waiting for server
+
+                    if(isLocal)
+                    {
+                        // Local player hit — cosmetic death while waiting for server PLAYER_KILL
+                        destroyPlayer(player);
+                        player->respawnFrames = 60;
+                    }
+                    // Remote target: don't apply cosmetic death locally,
+                    // wait for server PLAYER_KILL broadcast
                 }
                 else
                 {

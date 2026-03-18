@@ -209,6 +209,20 @@ static const char* lobbyGetPlayerName(int id)
     return "";
 }
 
+/* Get the winner's name from game roster using last_winner_id (game_player_id) */
+static const char* getWinnerName(void)
+{
+    const dnet_state_data_t* nd = dnet_get_data();
+    int i;
+    if (!nd->has_last_results || nd->last_winner_id == 0xFF)
+        return "";
+    for (i = 0; i < nd->game_roster_count && i < DNET_MAX_PLAYERS; i++) {
+        if (nd->game_roster[i].active && nd->game_roster[i].id == nd->last_winner_id)
+            return nd->game_roster[i].name;
+    }
+    return "";
+}
+
 /* Draw Z-overlay: results or leaderboard */
 static void draw_z_overlay(const dnet_state_data_t* nd)
 {
@@ -264,20 +278,25 @@ static void draw_z_overlay(const dnet_state_data_t* nd)
                       g_Players[pid].score.points % 10000,
                       g_Players[pid].numLives);
         }
-    } else if (g_z_page == 1 && nd->leaderboard_count > 0) {
+    } else if (g_z_page == 1) {
         /* Page 1: Online Leaderboard */
-        jo_printf(5, 8, "ONLINE LEADERBOARD");
-        jo_printf(2, 9, "#  NAME             W  SCR  GP");
-        for (i = 0; i < nd->leaderboard_count && i < 12; i++) {
-            jo_printf(2, 10 + i, "%-2d %-16s %2d %4d %3d",
-                      i + 1,
-                      nd->leaderboard[i].name,
-                      nd->leaderboard[i].wins,
-                      nd->leaderboard[i].best_score % 10000,
-                      nd->leaderboard[i].games_played % 1000);
+        if (nd->leaderboard_count > 0) {
+            jo_printf(5, 8, "ONLINE LEADERBOARD");
+            jo_printf(2, 9, "#  NAME             W  SCR  GP");
+            for (i = 0; i < nd->leaderboard_count && i < 12; i++) {
+                jo_printf(2, 10 + i, "%-2d %-16s %2d %4d %3d",
+                          i + 1,
+                          nd->leaderboard[i].name,
+                          nd->leaderboard[i].wins,
+                          nd->leaderboard[i].best_score % 10000,
+                          nd->leaderboard[i].games_played % 1000);
+            }
+        } else {
+            jo_printf(5, 8, "ONLINE LEADERBOARD");
+            jo_printf(6, 14, "No data yet");
         }
-    } else if (g_z_page == 0 && !nd->has_last_results) {
-        /* No results yet — show leaderboard instead */
+    } else {
+        /* Page 0 but no last results — show leaderboard instead */
         if (nd->leaderboard_count > 0) {
             jo_printf(5, 8, "ONLINE LEADERBOARD");
             jo_printf(2, 9, "#  NAME             W  SCR  GP");
@@ -351,26 +370,23 @@ void lobby_draw(void)
     }
 
     /* Player list - compact rows to fit up to 12 */
-    for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
-        int row = 10 + i;
-        const char* name = nd->lobby_players[i].name;
-        const char* ready_str = nd->lobby_players[i].ready ? "READY" : "---";
+    {
+        const char* winner_name = getWinnerName();
 
-        jo_printf(3, row, "%-16s %-5s", name, ready_str);
+        for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
+            int row = 10 + i;
+            const char* name = nd->lobby_players[i].name;
+            const char* ready_str = nd->lobby_players[i].ready ? "READY" : "---  ";
 
-        /* Show WIN! next to the last game's winner */
-        if (nd->has_last_results && nd->lobby_players[i].id == nd->last_winner_id) {
-            jo_printf(25, row, "WIN!");
-        } else {
-            jo_printf(25, row, "    ");
-        }
+            jo_printf(3, row, "%-16s %-5s", name, ready_str);
 
-        /* Colored dot next to each player showing their assigned color */
-        {
-            int dotX = 1 * 8 - 160;       /* column 1 in VDP1 coords */
-            int dotY = (row) * 8 - 120;   /* row in VDP1 coords */
-            int playerColor = g_Assets.hudColors[i % MAX_PLAYERS];
-            drawLetter('.', playerColor, dotX, dotY, 1, 1);
+            /* Show WIN! next to the last game's winner — match by name since
+             * lobby id (user_id / 200+bot_id) differs from game_player_id */
+            if (winner_name[0] != '\0' && strcmp(name, winner_name) == 0) {
+                jo_printf(26, row, "WIN!");
+            } else {
+                jo_printf(26, row, "    ");
+            }
         }
     }
 

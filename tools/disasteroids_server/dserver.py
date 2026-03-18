@@ -1669,7 +1669,12 @@ class DisasteroidsServer:
 
     def _handle_ship_asteroid_hit(self, sock, client: ClientInfo,
                                   payload: bytes):
-        """Handle SHIP_ASTEROID_HIT: Saturn detected local player hit asteroid."""
+        """Handle SHIP_ASTEROID_HIT: Saturn detected player hit asteroid or PvP kill.
+
+        For ship-asteroid (slot != 0xFF): target must be sender's own player.
+        For PvP projectile kill (slot == 0xFF): target can be any player
+        (allows Saturn to report hitting remote players / bots).
+        """
         if not self.game_active or not client.in_game or not self.sim:
             return
         if len(payload) < 3:
@@ -1678,10 +1683,15 @@ class DisasteroidsServer:
         slot = payload[1]
         player_id = payload[2]
 
-        # Validate player_id belongs to this client
-        valid_ids = [client.game_player_id] + client.local_player_ids
-        if player_id not in valid_ids:
-            return
+        # For ship-asteroid collision, validate target belongs to sender.
+        # For PvP kill (slot=0xFF), any valid in-game player is acceptable.
+        if slot != 0xFF:
+            valid_ids = [client.game_player_id] + client.local_player_ids
+            if player_id not in valid_ids:
+                return
+        else:
+            if player_id not in self.sim.players:
+                return
 
         # Validate player is alive and not invulnerable
         p = self.sim.players.get(player_id)
