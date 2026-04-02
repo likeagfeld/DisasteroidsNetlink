@@ -22,7 +22,7 @@ extern void slSynch(void);
  * Configuration
  *============================================================================*/
 
-#define CONNECT_DIAL_NUMBER   "778"
+#define CONNECT_DIAL_NUMBER   "199402"
 #define CONNECT_DIAL_TIMEOUT  180000000  /* ~60 seconds at 28.6MHz */
 
 /*============================================================================

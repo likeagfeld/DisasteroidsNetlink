@@ -4,7 +4,7 @@ Created on Thu May 19 08:01:31 2022
 
 @author: joe
 """
-#netlink_version=202603061920
+#netlink_version=202603271607
 import sys
 
 if __name__ == "__main__":
@@ -23,12 +23,14 @@ import platform
 import requests
 import subprocess
 import errno
+import re
+import binascii
+import configparser
 try:
     import sh
 except ModuleNotFoundError:
     pass
 import ipaddress
-import configparser
 try:
     import dreampi
 except ImportError:
@@ -42,27 +44,26 @@ except ImportError:
 class Netlink:
     pythonVer = platform.python_version_tuple()[0]
     osName = os.name
-    if osName == 'posix':
-        logger = logging.getLogger('dreampi')
-    else:
-        logger = logging.getLogger('Netlink')
+    # if osName == 'posix':
+    #     logger = logging.getLogger('dreampi')
+    # else:
+    #     logger = logging.getLogger('Netlink')
     if osName == 'posix': # should work on linux and Mac for USB modem, but untested.
         femtoSipPath = "/home/pi/dreampi/femtosip"
     else:
         femtoSipPath = os.path.realpath('./')+"/femtosip"
-    logger.setLevel(logging.INFO)
+    # logger.setLevel(logging.INFO)
     packetSplit = b"<packetSplit>"
     dataSplit = b"<dataSplit>"
     timeout = 0.003
 
-    def __init__(self, modem):
+    def __init__(self, modem, verbose = False, printout = False):
         self.modem = modem
         self.pinging = True
-        self.printout = False
+        self.printout = printout
         self.data = []
         self.state = "starting"
         self.poll_rate = 0.01
-        self._last_keepalive = time.time()  # keepalive timer to prevent USB auto-suspend
         self.matching = True
         self.udp = None
         self.mode = "idle"
@@ -76,37 +77,83 @@ class Netlink:
         self.xband_sock = None
         self.xband_listening = False
         self.sip_ring = None
-        self.usb_baud = 115200
+        self.valid_bauds = (115200, 38400)
+        self.baud_index = 0
+        self.usb_baud = self.valid_bauds[0]
         self.usb_timeout = 0.1
         self.usb = None
         self.tun_dc_ip = None
         self.dreamcast_ip = None
         self.usb_serial_port = "/dev/ttyUSB0"
-        # Load server dial-code config
+        self.verbose = verbose
+
+        self.logger = logging.getLogger('Tunnel.%s' % id(self))
+        self.logger.setLevel(logging.DEBUG)
+        # prevent double logging via root logger
+        self.logger.propagate = False
+        formatter = logging.Formatter(
+            '%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
+            '%Y-%m-%d %H:%M:%S'
+        )
+        if self.verbose:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(formatter)
+        else:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+        
+        self.logger.addHandler(handler)
+        if self.verbose:
+            self.logger.debug("verbose logging enabled")
+        if self.printout:
+            self.logger.debug("Tunnel raw data printing enabled. Not recommended for normal use")
+
+        # <Netlink Server Addition>
         self.servers = {}
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'servers_config.ini')
         if os.path.exists(config_path):
             cfg = configparser.ConfigParser()
             cfg.read(config_path)
             for section in cfg.sections():
-                if section.startswith('server.'):
-                    code = section.split('.', 1)[1]
+                if section.startswith('server:'):
+                    code = section.split(':', 1)[1]
                     self.servers[code] = dict(cfg.items(section))
+            # Validate server codes. Don't just accept anything
+            pattern = r'^1994\d{2}$'
+            self.servers = {k: v for k, v in self.servers.items() if bool(re.match(pattern, k))}
             if self.servers:
-                self.logger.info("Server dial codes loaded: %s", list(self.servers.keys()))
+                self.logger.info("Server ID codes loaded: %s", list(self.servers.keys()))
+        # </Netlink Server Addition>
 
-        # check for serial port on linux
+        # check for serial port on linux and configure
         if self.osName == 'posix':
+            config_paths = [
+                "/boot/config.txt",
+                "/boot/firmware/config.txt"
+            ]
+            for path in config_paths:
+                try:
+                    with open(path) as f:
+                        for line in f:
+                            if "enable_uart=1" in line:
+                                self.usb_serial_port = "/dev/serial0"
+                except (IOError, OSError):
+                    continue
+
             try:
                 self.usb = serial.Serial(self.usb_serial_port, baudrate=self.usb_baud, rtscts=False, exclusive=True)
                 self.usb.rts = True
                 self.usb.timeout = self.usb_timeout
-                self.logger.info("USB-Serial device found! Serial port monitoring started. PPP available.")
+                self.logger.info("USB-Serial device found! Serial port monitoring started on %s. PPP available." % self.usb_serial_port)
             except serial.SerialException:
-                # self.logger.info("No USB-Serial adapter detected")
+                # self.logger.info("No active serial port detected")
                 self.usb = None
+        self.logger.debug("Netlink class initialized. ms = %s" % self.ms)
 
-
+    def hexlify(self, data):
+        return ' '.join('{:02X}'.format(ord(c) if isinstance(c, str) else c) for c in data)
+    
     def digit_parser(self):
         last_heard = time.time()
         raw_string = ""
@@ -131,12 +178,13 @@ class Netlink:
             self.mode = "netlink"
             self.dial_string = raw_string
             return {'client':self.mode,'dial_string':raw_string}
+        # <Netlink Server Addition>
         elif raw_string in self.servers:
-            # Config-driven server dial code (e.g. 698, 777, 699)
-            self.ms = "calling"
-            self.mode = "netlink"
+            self.mode = "netlink_server"
             self.dial_string = raw_string
-            return {'client':self.mode, 'dial_string':raw_string}
+            self.logger.debug("Netlink server connection requested. ms = %s" % self.ms)
+            return {'client':self.mode,'dial_string':raw_string}
+         # </Netlink Server Addition>
         elif raw_string == "*70":
             self.logger.info("Call waiting disabled")
             self.mode = "idle"
@@ -145,6 +193,7 @@ class Netlink:
         elif raw_string in ["18002071194","19209492263","0120717360","0355703001"]:
             self.mode = "xband_server"
             self.dial_string = ""
+            self.logger.debug("xband server called. ms = %s" % self.ms)
             return {'client':self.mode, 'dial_string':raw_string}
         elif raw_string.startswith("#") and raw_string.endswith("#"):
             dial_string = raw_string.replace("#","")
@@ -179,6 +228,7 @@ class Netlink:
                 self.ms = "calling"
                 self.mode = "netlink"
                 self.dial_string = dial_string
+                self.logger.debug("Netlink matchmaking call. ms = %s" % self.ms)
                 return {'client':self.mode,'dial_string':raw_string}             
         else:
             if len(raw_string) > 0: # any sequence that we don't recognize, assume is meant to be PPP
@@ -417,6 +467,7 @@ class Netlink:
         return external_ip, external_port
 
     def listener(self, opponent):
+        self.logger.debug("listener thread started")
         self.logger.info(self.state)
         pingCount = 0
         lastPing = 0
@@ -492,7 +543,8 @@ class Netlink:
                         currentSequence = int(sequence) + 1
                         
                         toSend = payload
-                        
+                        if self.printout:
+                            self.logger.debug("received: " + self.hexlify(toSend))
                         self.modem._serial.write(toSend)
                         if packetNum == 0: # if the first packet was the processed packet,  no need to go through the rest
                             break
@@ -505,6 +557,7 @@ class Netlink:
     def sender(self, opponent):
         first_run = True
         self.logger.info("Sending")
+        self.logger.debug("Sending thread started. Sending to %s" % str(opponent))
         sequence = 0
         packets = []
         self.modem._serial.timeout = None
@@ -539,7 +592,8 @@ class Netlink:
                         ready = select.select([],[self.udp],[]) #blocking select  
                         if ready[1]:
                             self.udp.sendto(self.packetSplit.join(packets), opponent)
-                                
+                    if self.printout:
+                        self.logger.debug("sent: " + self.hexlify(payload))        
                     sequence+=1
             except:
                 continue
@@ -558,7 +612,7 @@ class Netlink:
                 self.udp.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 184)
                 self.udp.bind(('', Port))
             self.udp.settimeout(0.0) # non blocking. Should use select when reading or writing to ensure the socket is available.
-            
+            self.logger.debug("starting data exchange. %s. UDP bound to port: %s" % (self.ms, self.udp.getsockname()[1]))
             t1.start()
             t2.start()
             t1.join()
@@ -569,8 +623,8 @@ class Netlink:
         self.close_udp()
         try:
             self.modem.connect_netlink(speed=57600,timeout=0.01,rtscts = True) #non-blocking version
-            self.modem.query_modem(b'AT\x25E0\V1')
-            self.modem.query_modem(b'AT\x25C0\N3')
+            self.modem.query_modem(b'AT%E0\\V1')
+            self.modem.query_modem(b'AT%C0\\N3')
             # self.modem.query_modem(b'AT+MS=V32b,1,14400,14400,14400,14400') probably not necessary to be so explicit with rates and modulation
             self.modem.query_modem(b"ATA", timeout=30, response = "CONNECT")
         except IOError:
@@ -585,7 +639,468 @@ class Netlink:
             return
         self.netlink_exchange(state, opponent)
 
-    def do_transparent(self, server_cfg):
+    def getserial(self):
+        cpuserial = b"0000000000000000"
+        if self.osName == 'posix':
+            try:
+                f = open('/proc/cpuinfo','r')
+                for line in f:
+                    if line[0:6]=='Serial':
+                        cpuserial = line[10:26].encode()
+                f.close()
+                self.logger.info("Found valid CPU ID")
+            except:
+                cpuserial = b"ERROR000000000"
+                self.logger.info("Couldn't find valid CPU ID, using error ID")
+        else:
+            cpuserial = subprocess.check_output(["wmic","cpu","get","ProcessorId","/format:csv"]).strip().split(b",")[-1]
+            self.logger.info("Found valid CPU ID")
+        return cpuserial
+
+    def xband_server(self):
+        self.modem.stop_dial_tone()
+        try:
+            self.modem.query_modem(b"ATA", timeout=30, response = "CONNECT")
+        except IOError:
+            return
+        self.modem._serial.timeout = 1
+        self.logger.info("connecting to retrocomputing.network")
+        s = socket.socket()
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setblocking(False)
+        s.settimeout(15)
+        s.connect(("xbserver.retrocomputing.network", 56969))
+        # cpu = subprocess.check_output(["wmic","cpu","get","ProcessorId","/format:csv"]).strip().split(b",")[-1]
+        hwid = self.getserial()
+        sdata = b"///////PI-" + hwid + b"\x0a"
+        sentid = 0
+        self.logger.info("connected")
+        while True:
+            try:
+                ready = select.select([s], [], [],0.3)
+                if ready[0]:
+                    data = s.recv(1024)
+                    # print(data)
+                    self.modem._serial.write(data)
+                if sentid == 0:
+                    s.send(sdata)
+                    sentid = 1
+            except socket.error as e:
+                err = e.args[0]
+                if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+                    time.sleep(0.1)
+                else:
+                    self.logger.warn("tcp connection dropped")
+                    break
+            if not self.modem._serial.cd:
+                self.logger.info("1: CD is not asserted")
+                time.sleep(2.0)
+                if not self.modem._serial.cd:
+                    self.logger.info("CD still not asserted after 2 sec - xband hung up")
+                    break
+            if sentid == 1:        
+                if self.modem._serial.in_waiting:
+                    line = b""
+                    while True:
+                        data2 = self.modem._serial.read(1)
+                        line += data2
+                        if b"\x10\x03" in line: #this is used to indicate end of line/data
+                            # print(line)
+                            s.send(line)
+                            break
+                        if not self.modem._serial.cd:
+                            self.logger.info("2: CD is not asserted")
+                            time.sleep(2.0)
+                            if not self.modem._serial.cd:
+                                self.logger.info("CD still not asserted after 2 sec - xband hung up")
+                                break
+        s.close()
+        self.logger.info("Xband disconnected. Back to listening")
+        self.mode = "xband_matching"
+        self.ms = "waiting"
+        self.modem.connect()
+        self.modem.start_dial_tone()
+        return
+    
+    def xband_match(self):
+        if self.udp:
+            self.close_udp()
+        if self.xband_init == False:
+            self.xband_setup()
+        if time.time() - self.xband_timer < 15: # an xband call should start right away. Don't listen if you don't have to.
+            self.logger.debug("Exiting xband_match function. t < 15")
+            return
+        if time.time() - self.xband_timer > 900:
+            self.mode = "idle"
+            self.close_xband()
+            self.logger.debug("Exiting xband_match function. t > 900")
+            return
+        if not self.xband_sock:
+            self.open_xband()
+            self.logger.info("Listening for xband call")
+        xbandResult,opponent = self.xband_listen()
+        if xbandResult == "connected":
+            self.netlink_exchange(state = "connected", opponent = (opponent, 20002))
+            self.logger.info("Xband Disconnected")
+            self.mode = "idle"
+            self.modem.connect()
+            self.modem.start_dial_tone()
+            self.close_xband()
+
+    def xband_setup(self):
+        if not os.path.exists(self.femtoSipPath): # femtosip is not distributed with the rest of these scripts. Only fetched if needed.
+            self.logger.debug("Femtosip folder not found. Downloading component")
+            try:
+                os.makedirs(self.femtoSipPath)
+                r = requests.get("https://raw.githubusercontent.com/eaudunord/femtosip/master/femtosip.py")
+                r.raise_for_status()
+                with open(self.femtoSipPath+"/femtosip.py",'wb') as f:
+                    text = r.content.decode('ascii','ignore').encode()
+                    f.write(text)
+                self.logger.info('fetched femtosip')
+                r = requests.get("https://github.com/astoeckel/femtosip/raw/master/LICENSE")
+                r.raise_for_status()
+                with open(self.femtoSipPath+"/LICENSE",'wb') as f:
+                    f.write(r.content)
+                self.logger.info('fetched LICENSE')
+                with open(self.femtoSipPath+"/__init__.py",'wb') as f:
+                    pass
+                self.xband_init = True
+                self.logger.debug("Femtosip downloaded")
+            except requests.exceptions.HTTPError:
+                self.logger.info("unable to fetch femtosip")
+                return "dropped"
+            except OSError:
+                self.logger.info("error creating femtosip directory")
+        else:
+            self.logger.debug("Femtosip folder found")
+            self.xband_init = True
+        
+
+    def open_xband(self):
+        if not self.xband_sock:
+            self.logger.debug("open_xband. Listening socket created")
+            PORT = 65433
+            self.xband_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.xband_sock.setblocking(0)
+            self.xband_sock.bind(('', PORT))
+            self.xband_sock.listen(5)
+        self.xband_listening = True
+        self.logger.debug("open_xband. Listening socket exists")
+
+    def close_xband(self):
+        try:
+            if self.xband_sock:
+                self.xband_sock.close()
+                time.sleep(2)
+                self.xband_sock = None
+            self.xband_listening = False
+        except:
+            self.logger.debug("problem closing listening xband socket")
+            pass
+
+    def close_udp(self):
+        if self.udp:
+            self.udp.close()
+            self.udp = None
+
+    def xband_listen(self):
+        result = ("nothing","")
+        ready = select.select([self.xband_sock], [], [],0)
+        if ready[0]:
+            self.logger.info("incoming xband call")
+            conn, addr = self.xband_sock.accept()
+            opponent = addr[0]
+            callTime = time.time()
+            while True:
+                ready = select.select([conn], [], [],0)
+                if ready[0]:
+                    data = conn.recv(1024)
+                    if data == b"RESET":
+                        self.modem.stop_dial_tone()
+                        self.init_xband()
+                        conn.sendall(b'ACK RESET')
+                    elif data == b"RING":
+                        self.logger.info("RING")
+                        conn.sendall(b'ANSWERING')
+                        time.sleep(6)
+                        self.logger.info('Answering')
+                        try:
+                            self.modem.query_modem(b"ATX1D", timeout=30, response = "CONNECT")
+                        except IOError:
+                            self.logger.info("Couldn't answer call")
+                            self.reset()
+                            result = ("dropped","")
+                            break
+                        self.logger.info("CONNECTED")
+                    elif data == b"PING":
+                        conn.sendall(b'ACK PING')
+                        self.modem._serial.timeout=None
+                        self.modem._serial.write(b'\xff')
+                        while True:
+                            char = self.modem._serial.read(1) #read through the buffer and skip all 0xff
+                            if char == b'\xff':
+                                continue
+                            elif char == b'\x01':
+                                conn.sendall(b'RESPONSE')
+                                self.logger.info('got a response')
+                                break
+                        if self.modem._serial.cd: #if we stayed connected
+                            continue
+                            
+                        elif not self.modem._serial.cd: #if we dropped the call
+                            self.logger.info("Xband Disconnected")
+                            self.modem.connect()
+                            self.modem.start_dial_tone()
+                            result = ("dropped","")
+                            break
+                        
+                    elif data == b'RESPONSE':
+                        self.modem._serial.write(b'\x01')
+                        if self.modem._serial.cd:
+                            result = ("connected",opponent)
+                            break
+                        
+                    if time.time() - callTime > 120:
+                        break
+        self.logger.debug("xband_listen exited. Result: %s" % str(result))
+        return result
+    
+    def init_xband(self):
+        self.modem.stop_dial_tone()
+        self.modem.connect_netlink(speed=57600,timeout=0.05,rtscts=True)
+        self.modem.query_modem(b'AT%E0')
+        self.modem.query_modem(b"AT\\V1%C0")
+        self.modem.query_modem(b'AT+MS=V22b')
+
+    def ring_phone(self):
+        import femtosip.femtosip as sip_ring
+        result = "hangup"
+        opponent = self.dial_string
+        opponent_id = "11"
+        opponent_port = 4000
+        PORT = 65433
+        self.close_udp()
+        sock_send = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock_send.settimeout(15)
+        self.logger.info("Calling opponent")
+        try:
+            r = requests.get("http://myipv4.p1.opendns.com/get_my_ip")
+            r.raise_for_status()
+            my_ip = r.json()['ip']
+        except requests.exceptions.HTTPError:
+            self.logger.info("Couldn't get WAN IP")
+            my_ip = "127.0.0.1"
+        except requests.exceptions.SSLError:
+            self.logger.info("Couldn't get WAN IP")
+            my_ip = "127.0.0.1"
+
+        try:
+            sock_send.connect((opponent, PORT))
+            sock_send.sendall(b"RESET")
+            sentCall = time.time()
+            while True:
+                ready = select.select([sock_send], [], [],0)
+                if ready[0]:
+                    data = sock_send.recv(1024)
+                    if data == b'ACK RESET':
+                        try:
+                            sip = sip_ring.SIP('user','',opponent,opponent_port,local_ip = my_ip,protocol="udp")
+                            sip.call(opponent_id,3)
+                        except Exception as e:
+                            self.logger.info("Error calling VoIP: %s" % e)
+                            result = "hangup"
+                            break 
+                        sock_send.sendall(b'RING')
+                    elif data == b'ANSWERING':
+                        self.logger.info("Answering")
+                        self.modem.query_modem(b"ATA", timeout=30, response = "CONNECT")
+                        self.logger.info("CONNECTED")
+                        sock_send.sendall(b'PING')
+
+                    elif data == b"ACK PING":
+                        self.modem._serial.timeout=None
+                        self.modem._serial.write(b'\xff')
+                        while True:
+                            char = self.modem._serial.read(1) #read through the buffer and skip all 0xff
+                            if char == b'\xff':
+                                continue
+                            elif char == b'\x01':
+                                # modem._serial.write(b'\x01')
+                                self.logger.info("got a response")
+                                sock_send.sendall(b'RESPONSE')
+                                break
+                        if self.modem._serial.cd: #if we stayed connected
+                            continue
+                            
+                        elif not self.modem._serial.cd:
+                            #if we dropped the call
+                            result =  "hangup"
+                            break
+
+                    elif data == b'RESPONSE':
+                        self.modem._serial.write(b'\x01')
+                        result = "connected"
+                        break
+                if time.time() - sentCall > 90:
+                    self.logger.info("opponent tunnel not responding")
+                    result = "hangup"
+                    break
+
+        except socket.error:
+            self.logger.info("couldn't connect to opponent")
+            result = "hangup"
+        
+        sock_send.close()
+        self.logger.debug("ring_phone exited. Result: %s" % str(result))
+        return result
+
+    def reset(self):
+        self.modem.stop_dial_tone()
+        self.modem.reset()
+        self.modem.connect()
+        try:
+            if self.modem._serial.in_waiting:
+                self.modem._serial.read(self.modem._serial.in_waiting)
+        except Exception:
+            pass
+        self.modem.start_dial_tone()
+        self.mode = "idle"
+        self.state = "starting"
+
+    def serial_poll(self):
+        if self.usb:
+            try:
+                if self.usb.in_waiting:
+                    payload = self.usb.read_until(b'\n')
+                    if len(payload) > 0:
+                        # if garbage is read, assume the baud rate is wrong
+                        try:
+                            payload.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # self.logger.info("serial port: %s" % binascii.hexlify(payload))
+                            # Don't switch on GDEMU/openMenu garbage
+                            if payload == b'\x00\xfb\x00':
+                                pass
+                            else:
+                                self.baud_index = (self.baud_index + 1) % len(self.valid_bauds)
+                                self.usb.baudrate = self.valid_bauds[self.baud_index]
+                                self.logger.info("Baud rate mismatch. Trying: %s" % self.usb.baudrate)
+                                return
+                        self.logger.info("serial port: %s" % payload.strip())
+                        if payload[:2] == b'AT':
+                            if payload == b'AT\r\n' or payload == b'AT\n':
+                                self.usb.write(b'OK\r\n')
+                            elif payload == b'ATZ\r\n' or payload == b'ATZ\n':
+                                self.usb.write(b'OK\r\n')
+                            elif payload[:4] == b'ATDT':
+                                self.usb.write(b'CONNECT ' + str(self.usb.baudrate).encode() + b'\r\n')
+                                self.logger.info("Call answered!")
+                                tun_ip =  dreampi.get_ip_address("tun0")
+                                if tun_ip is not None:
+                                    with open("/etc/ppp/options", "r") as f:
+                                        for line in f:
+                                            if "ms-dns" in line:
+                                                self.dreamcast_ip = line.split(" ")[1].replace("\n", "")
+                                    tun_ip_obj = ipaddress.IPv4Address(unicode(tun_ip,'utf-8'))
+                                    self.tun_dc_ip = tun_ip_obj + 1
+                                    tun_this_ip = self.tun_dc_ip + 1
+                                    dreampi.create_alias_interface(self.dreamcast_ip, str(self.tun_dc_ip))
+                                    
+                                else:
+                                    with open("/etc/ppp/peers/dreamcast", "r") as f:
+                                        for line in f:
+                                            if ":" in line:
+                                                self.dreamcast_ip = line.split(":")[1].replace("\n", "")
+                                    self.tun_dc_ip = self.dreamcast_ip
+                                    tun_this_ip = ipaddress.IPv4Address(unicode(self.dreamcast_ip,'utf-8')) + 1
+                                
+                                pppd_args = [
+                                    "pppd",
+                                    self.usb_serial_port, str(self.usb.baudrate),
+                                    "lcp-echo-interval", "5",
+                                    "local",
+                                    "lcp-echo-failure", "2",
+                                    "lcp-max-terminate", "1",
+                                    "novj",
+                                    str(tun_this_ip) + ":" + str(self.tun_dc_ip),
+                                    "ms-dns", str(self.tun_dc_ip) if tun_ip is not None else str(tun_this_ip),
+                                    "debug",
+                                    "ktune",
+                                    "noccp",
+                                    "noauth"
+                                ]
+
+                                time.sleep(5)
+
+                                self.logger.info(subprocess.check_output(pppd_args).decode())
+                                if self.usb and self.usb.is_open:
+                                    self.usb.flush() #added a flush, is data hanging on in the buffer?
+                                    self.usb.close()
+                                    self.usb = None
+                                self.logger.info("CONNECT")
+                                self.mode = "serial_ppp"
+                            else:
+                                self.usb.write(b'OK\r\n')
+            except IOError:
+                self.logger.info("USB serial device disconnected. Stopping serial port monitoring")
+                self.usb = None
+        else:
+            return 0
+        
+    def serial_ppp(self):
+        
+        from dcnow import DreamcastNowService
+        dcnow = DreamcastNowService()
+        dcnow.go_online("")
+
+            
+        for line in sh.tail("-f", "/var/log/messages", "-n", "1", _iter=True):
+            if "pppd" in line and "Exit" in line:#wait for pppd to execute the ip-down script
+                self.logger.info("Detected modem hang up, going back to listening")
+                break
+            if "pppd" in line and "Connection terminated." in line:
+                self.logger.info("pppd ip-down finished")
+                try:
+                    print(subprocess.check_output(['sudo', 'killall', 'pppd']))
+                    self.logger.info("kill 1")
+                    time.sleep(5)
+                    print(subprocess.check_output(['sudo', 'killall', 'pppd']))
+                    self.logger.info("kill 2")
+                    # why do I have to do this twice? pppd doesn't detect a hangup when ppp disconnects.
+                    # a cleaner solution would be preferable but this works
+                except Exception as e:
+                    print(e)
+        dreampi.remove_alias_interface()
+        dcnow.go_offline() #changed dcnow to wait 15 seconds for event instead of sleeping. Should be faster.
+        self.mode = "idle"
+        try:
+            self.usb = serial.Serial(self.usb_serial_port, baudrate=self.usb_baud, rtscts=False, exclusive=True)
+            self.usb.rts = True
+            self.usb.timeout = self.usb_timeout
+            self.baud_index = 0
+        except:
+            self.logger.info("No active serial port detected")
+            self.usb = None
+        self.logger.info('Reset serial port')
+
+    #<Netlink Server Addition>
+    def netlink_server(self):
+        if self.servers:
+            server = self.servers.get(self.dial_string)
+        else:
+            server = None
+        if server:
+            server_type = server.get('handler', 'server')
+            if server_type == 'transparent':
+                self.netlink_transparent_server(server)
+            else:
+                self.netlink_standard_server(server)
+
+        else:
+            self.logger.info("Couldn't find a matching config")
+
+    def netlink_transparent_server(self, server_cfg):
         """
         Transparent proxy handler for BBS-protocol games (e.g. Dragon's Dream).
         Answers modem, connects to TCP server, relays ALL data bidirectionally.
@@ -661,7 +1176,7 @@ class Netlink:
         s.close()
         self.logger.info("%s: Session Closed", label)
 
-    def do_server(self, server_cfg):
+    def netlink_standard_server(self, server_cfg):
         """
         Handle server connection from config.
         Answers the modem, connects to the configured TCP server,
@@ -784,425 +1299,8 @@ class Netlink:
                 time.sleep(0.01)
 
         s.close()
-        self.logger.info("%s: disconnected", label)
-
-    def getserial(self):
-        cpuserial = b"0000000000000000"
-        if self.osName == 'posix':
-            try:
-                f = open('/proc/cpuinfo','r')
-                for line in f:
-                    if line[0:6]=='Serial':
-                        cpuserial = line[10:26].encode()
-                f.close()
-                self.logger.info("Found valid CPU ID")
-            except:
-                cpuserial = b"ERROR000000000"
-                self.logger.info("Couldn't find valid CPU ID, using error ID")
-        else:
-            cpuserial = subprocess.check_output(["wmic","cpu","get","ProcessorId","/format:csv"]).strip().split(b",")[-1]
-            self.logger.info("Found valid CPU ID")
-        return cpuserial
-
-    def xband_server(self):
-        self.modem.stop_dial_tone()
-        try:
-            self.modem.query_modem("ATA", timeout=30, response = "CONNECT")
-        except IOError:
-            return
-        self.modem._serial.timeout = 1
-        self.logger.info("connecting to retrocomputing.network")
-        s = socket.socket()
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.setblocking(False)
-        s.settimeout(15)
-        s.connect(("xbserver.retrocomputing.network", 56969))
-        # cpu = subprocess.check_output(["wmic","cpu","get","ProcessorId","/format:csv"]).strip().split(b",")[-1]
-        hwid = self.getserial()
-        sdata = b"///////PI-" + hwid + b"\x0a"
-        sentid = 0
-        self.logger.info("connected")
-        while True:
-            try:
-                ready = select.select([s], [], [],0.3)
-                if ready[0]:
-                    data = s.recv(1024)
-                    # print(data)
-                    self.modem._serial.write(data)
-                if sentid == 0:
-                    s.send(sdata)
-                    sentid = 1
-            except socket.error as e:
-                err = e.args[0]
-                if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
-                    time.sleep(0.1)
-                else:
-                    self.logger.warn("tcp connection dropped")
-                    break
-            if not self.modem._serial.cd:
-                self.logger.info("1: CD is not asserted")
-                time.sleep(2.0)
-                if not self.modem._serial.cd:
-                    self.logger.info("CD still not asserted after 2 sec - xband hung up")
-                    break
-            if sentid == 1:        
-                if self.modem._serial.in_waiting:
-                    line = b""
-                    while True:
-                        data2 = self.modem._serial.read(1)
-                        line += data2
-                        if b"\x10\x03" in line: #this is used to indicate end of line/data
-                            # print(line)
-                            s.send(line)
-                            break
-                        if not self.modem._serial.cd:
-                            self.logger.info("2: CD is not asserted")
-                            time.sleep(2.0)
-                            if not self.modem._serial.cd:
-                                self.logger.info("CD still not asserted after 2 sec - xband hung up")
-                                break
-        s.close()
-        self.logger.info("Xband disconnected. Back to listening")
-        self.mode = "xband_matching"
-        self.ms = "waiting"
-        self.modem.connect()
-        self.modem.start_dial_tone()
-        return
-    
-    def xband_match(self):
-        if self.udp:
-            self.close_udp()
-        if self.xband_init == False:
-            self.xband_setup()
-        if time.time() - self.xband_timer < 15: # an xband call should start right away. Don't listen if you don't have to.
-            return
-        if time.time() - self.xband_timer > 900:
-            self.mode = "idle"
-            self.close_xband()
-            return
-        if not self.xband_sock:
-            self.open_xband()
-            self.logger.info("Listening for xband call")
-        xbandResult,opponent = self.xband_listen()
-        if xbandResult == "connected":
-            self.netlink_exchange(state = "connected", opponent = (opponent, 20002))
-            self.logger.info("Xband Disconnected")
-            self.mode = "idle"
-            self.modem.connect()
-            self.modem.start_dial_tone()
-            self.close_xband()
-
-    def xband_setup(self):
-        if not os.path.exists(self.femtoSipPath): # femtosip is not distributed with the rest of these scripts. Only fetched if needed.
-            try:
-                os.makedirs(self.femtoSipPath)
-                r = requests.get("https://raw.githubusercontent.com/eaudunord/femtosip/master/femtosip.py")
-                r.raise_for_status()
-                with open(self.femtoSipPath+"/femtosip.py",'wb') as f:
-                    text = r.content.decode('ascii','ignore').encode()
-                    f.write(text)
-                self.logger.info('fetched femtosip')
-                r = requests.get("https://github.com/astoeckel/femtosip/raw/master/LICENSE")
-                r.raise_for_status()
-                with open(self.femtoSipPath+"/LICENSE",'wb') as f:
-                    f.write(r.content)
-                self.logger.info('fetched LICENSE')
-                with open(self.femtoSipPath+"/__init__.py",'wb') as f:
-                    pass
-                self.xband_init = True
-            except requests.exceptions.HTTPError:
-                self.logger.info("unable to fetch femtosip")
-                return "dropped"
-            except OSError:
-                self.logger.info("error creating femtosip directory")
-        else:
-            self.xband_init = True
-        
-
-    def open_xband(self):
-        if not self.xband_sock:
-            PORT = 65433
-            self.xband_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.xband_sock.setblocking(0)
-            self.xband_sock.bind(('', PORT))
-            self.xband_sock.listen(5)
-        self.xband_listening = True
-
-    def close_xband(self):
-        try:
-            if self.xband_sock:
-                self.xband_sock.close()
-                time.sleep(2)
-                self.xband_sock = None
-            self.xband_listening = False
-        except:
-            pass
-
-    def close_udp(self):
-        if self.udp:
-            self.udp.close()
-            self.udp = None
-
-    def xband_listen(self):
-        result = ("nothing","")
-        ready = select.select([self.xband_sock], [], [],0)
-        if ready[0]:
-            self.logger.info("incoming xband call")
-            conn, addr = self.xband_sock.accept()
-            opponent = addr[0]
-            callTime = time.time()
-            while True:
-                ready = select.select([conn], [], [],0)
-                if ready[0]:
-                    data = conn.recv(1024)
-                    if data == b"RESET":
-                        self.modem.stop_dial_tone()
-                        self.init_xband()
-                        conn.sendall(b'ACK RESET')
-                    elif data == b"RING":
-                        self.logger.info("RING")
-                        conn.sendall(b'ANSWERING')
-                        time.sleep(6)
-                        self.logger.info('Answering')
-                        try:
-                            self.modem.query_modem("ATX1D", timeout=30, response = "CONNECT")
-                        except IOError:
-                            self.logger.info("Couldn't answer call")
-                            self.reset()
-                            result = ("dropped","")
-                            break
-                        self.logger.info("CONNECTED")
-                    elif data == b"PING":
-                        conn.sendall(b'ACK PING')
-                        self.modem._serial.timeout=None
-                        self.modem._serial.write(b'\xff')
-                        while True:
-                            char = self.modem._serial.read(1) #read through the buffer and skip all 0xff
-                            if char == b'\xff':
-                                continue
-                            elif char == b'\x01':
-                                conn.sendall(b'RESPONSE')
-                                self.logger.info('got a response')
-                                break
-                        if self.modem._serial.cd: #if we stayed connected
-                            continue
-                            
-                        elif not self.modem._serial.cd: #if we dropped the call
-                            self.logger.info("Xband Disconnected")
-                            self.modem.connect()
-                            self.modem.start_dial_tone()
-                            result = ("dropped","")
-                            break
-                        
-                    elif data == b'RESPONSE':
-                        self.modem._serial.write(b'\x01')
-                        if self.modem._serial.cd:
-                            result = ("connected",opponent)
-                    if time.time() - callTime > 120:
-                        break
-        return result
-    
-    def init_xband(self):
-        self.modem.stop_dial_tone()
-        self.modem.connect_netlink(speed=57600,timeout=0.05,rtscts=True)
-        self.modem.query_modem(b'AT\x25E0')
-        self.modem.query_modem(b"AT\V1\x25C0")
-        self.modem.query_modem(b'AT+MS=V22b')
-
-    def ring_phone(self):
-        import femtosip.femtosip as sip_ring
-        result = "hangup"
-        opponent = self.dial_string
-        opponent_id = "11"
-        opponent_port = 4000
-        PORT = 65433
-        self.close_udp()
-        sock_send = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock_send.settimeout(15)
-        self.logger.info("Calling opponent")
-        try:
-            r = requests.get("http://myipv4.p1.opendns.com/get_my_ip")
-            r.raise_for_status()
-            my_ip = r.json()['ip']
-        except requests.exceptions.HTTPError:
-            self.logger.info("Couldn't get WAN IP")
-            my_ip = "127.0.0.1"
-        except requests.exceptions.SSLError:
-            self.logger.info("Couldn't get WAN IP")
-            my_ip = "127.0.0.1"
-
-        try:
-            sock_send.connect((opponent, PORT))
-            sock_send.sendall(b"RESET")
-            sentCall = time.time()
-            while True:
-                ready = select.select([sock_send], [], [],0)
-                if ready[0]:
-                    data = sock_send.recv(1024)
-                    if data == b'ACK RESET':
-                        try:
-                            sip = sip_ring.SIP('user','',opponent,opponent_port,local_ip = my_ip,protocol="udp")
-                            sip.call(opponent_id,3)
-                        except Exception as e:
-                            self.logger.info("Error calling VoIP: %s" % e)
-                            result = "hangup"
-                            break 
-                        sock_send.sendall(b'RING')
-                    elif data == b'ANSWERING':
-                        self.logger.info("Answering")
-                        self.modem.query_modem("ATA", timeout=30, response = "CONNECT")
-                        self.logger.info("CONNECTED")
-                        sock_send.sendall(b'PING')
-
-                    elif data == b"ACK PING":
-                        self.modem._serial.timeout=None
-                        self.modem._serial.write(b'\xff')
-                        while True:
-                            char = self.modem._serial.read(1) #read through the buffer and skip all 0xff
-                            if char == b'\xff':
-                                continue
-                            elif char == b'\x01':
-                                # modem._serial.write(b'\x01')
-                                self.logger.info("got a response")
-                                sock_send.sendall(b'RESPONSE')
-                                break
-                        if self.modem._serial.cd: #if we stayed connected
-                            continue
-                            
-                        elif not self.modem._serial.cd:
-                            #if we dropped the call
-                            result =  "hangup"
-                            break
-
-                    elif data == b'RESPONSE':
-                        self.modem._serial.write(b'\x01')
-                        result = "connected"
-                        break
-                if time.time() - sentCall > 90:
-                    self.logger.info("opponent tunnel not responding")
-                    result = "hangup"
-                    break
-
-        except socket.error:
-            self.logger.info("couldn't connect to opponent")
-            result = "hangup"
-        
-        sock_send.close()
-        return result
-
-    def reset(self):
-        # Drain any stale data from serial buffer before re-initializing
-        try:
-            if self.modem._serial.in_waiting:
-                self.modem._serial.read(self.modem._serial.in_waiting)
-        except Exception:
-            pass
-        self.modem.connect()
-        self.modem.start_dial_tone()
-        self.mode = "idle"
-        self.state = "starting"
-        self._last_keepalive = time.time()
-
-    def serial_poll(self):
-        if self.usb:
-            try:
-                payload = self.usb.read_until(b'\n')
-                if len(payload) > 0:
-                    self.logger.info("serial port: %s" % payload.strip())
-                    if payload[:2] == b'AT':
-                        if payload == b'AT\r\n' or payload == b'AT\n':
-                            self.usb.write(b'OK\r\n')
-                        elif payload == b'ATZ\r\n' or payload == b'ATZ\n':
-                            self.usb.write(b'OK\r\n')
-                        elif payload[:4] == b'ATDT':
-                            self.usb.write(b'CONNECT 115200\r\n')
-                            self.logger.info("Call answered!")
-                            tun_ip =  dreampi.get_ip_address("tun0")
-                            if tun_ip is not None:
-                                with open("/etc/ppp/options", "r") as f:
-                                    for line in f:
-                                        if "ms-dns" in line:
-                                            self.dreamcast_ip = line.split(" ")[1].replace("\n", "")
-                                tun_ip_obj = ipaddress.IPv4Address(unicode(tun_ip,'utf-8'))
-                                self.tun_dc_ip = tun_ip_obj + 1
-                                tun_this_ip = self.tun_dc_ip + 1
-                                dreampi.create_alias_interface(self.dreamcast_ip, str(self.tun_dc_ip))
-                                
-                            else:
-                                with open("/etc/ppp/peers/dreamcast", "r") as f:
-                                    for line in f:
-                                        if ":" in line:
-                                            self.dreamcast_ip = line.split(":")[1].replace("\n", "")
-                                self.tun_dc_ip = self.dreamcast_ip
-                                tun_this_ip = ipaddress.IPv4Address(unicode(self.dreamcast_ip,'utf-8')) + 1
-                            
-                            pppd_args = [
-                                "pppd",
-                                self.usb_serial_port, str(self.usb_baud),
-                                "lcp-echo-interval", "5",
-                                "local",
-                                "lcp-echo-failure", "2",
-                                "lcp-max-terminate", "1",
-                                "novj",
-                                str(tun_this_ip) + ":" + str(self.tun_dc_ip),
-                                "ms-dns", str(self.tun_dc_ip) if tun_ip is not None else str(tun_this_ip),
-                                "debug",
-                                "ktune",
-                                "noccp",
-                                "noauth"
-                            ]
-
-                            time.sleep(5)
-
-                            self.logger.info(subprocess.check_output(pppd_args).decode())
-                            if self.usb and self.usb.is_open:
-                                self.usb.flush() #added a flush, is data hanging on in the buffer?
-                                self.usb.close()
-                                self.usb = None
-                            self.logger.info("CONNECT")
-                            self.mode = "serial_ppp"
-                        else:
-                            self.usb.write(b'OK\r\n')
-            except IOError:
-                self.logger.info("USB serial device disconnected. Stopping serial port monitoring")
-                self.usb = None
-        else:
-            return 0
-        
-    def serial_ppp(self):
-        
-        from dcnow import DreamcastNowService
-        dcnow = DreamcastNowService()
-        dcnow.go_online("")
-
-            
-        for line in sh.tail("-f", "/var/log/messages", "-n", "1", _iter=True):
-            if "pppd" in line and "Exit" in line:#wait for pppd to execute the ip-down script
-                self.logger.info("Detected modem hang up, going back to listening")
-                break
-            if "pppd" in line and "Connection terminated." in line:
-                self.logger.info("pppd ip-down finished")
-                try:
-                    print(subprocess.check_output(['sudo', 'killall', 'pppd']))
-                    self.logger.info("kill 1")
-                    time.sleep(5)
-                    print(subprocess.check_output(['sudo', 'killall', 'pppd']))
-                    self.logger.info("kill 2")
-                    # why do I have to do this twice? pppd doesn't detect a hangup when ppp disconnects.
-                    # a cleaner solution would be preferable but this works
-                except Exception as e:
-                    print(e)
-        dreampi.remove_alias_interface()
-        dcnow.go_offline() #changed dcnow to wait 15 seconds for event instead of sleeping. Should be faster.
-        self.mode = "idle"
-        try:
-            self.usb = serial.Serial(self.usb_serial_port, baudrate=self.usb_baud, rtscts=False, exclusive=True)
-            self.usb.rts = True
-            self.usb.timeout = self.usb_timeout
-        except:
-            self.logger.info("No USB-Serial adapter detected")
-            self.usb = None
-        self.logger.info('Reset serial port')
+        self.logger.info("%s: disconnected", label)   
+    # </Netlink Server Addition> 
 
     def poll(self):
         if time.time() - self.xband_timer > 900 and self.xband_listening:
@@ -1211,16 +1309,6 @@ class Netlink:
         if self.usb:
             self.serial_poll()
         if self.mode == "idle":
-            # Periodic keepalive: ping modem every 5 min to prevent USB auto-suspend
-            if time.time() - self._last_keepalive > 300:
-                self._last_keepalive = time.time()
-                try:
-                    self.modem._serial.write(b"AT\r\n")
-                    time.sleep(0.1)
-                    if self.modem._serial.in_waiting:
-                        self.modem._serial.read(self.modem._serial.in_waiting)
-                except Exception:
-                    pass
             return 0
         elif self.mode == "PPP":
             return 0
@@ -1229,17 +1317,7 @@ class Netlink:
 
     def mode_handler(self):
         if self.mode == "netlink":
-            server = self.servers.get(self.dial_string)
-            if server:
-                handler_type = server.get('handler', 'server')
-                if handler_type == 'transparent':
-                    # No serial flush — game sends BBS commands immediately
-                    self.do_transparent(server)
-                else:
-                    # Standard handler (flushes serial, optional auth)
-                    self.do_server(server)
-            else:
-                self.do_netlink()
+            self.do_netlink()
             self.reset()
         elif self.mode == "xband_matching":
             self.xband_match()
@@ -1258,6 +1336,10 @@ class Netlink:
                 self.reset()
         elif self.mode == "serial_ppp":
             self.serial_ppp()
+        elif self.mode == "netlink_server":
+            self.netlink_server()
+            self.reset()
         else:
             return 0
         return 0
+    

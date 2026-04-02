@@ -209,20 +209,6 @@ static const char* lobbyGetPlayerName(int id)
     return "";
 }
 
-/* Get the winner's name from game roster using last_winner_id (game_player_id) */
-static const char* getWinnerName(void)
-{
-    const dnet_state_data_t* nd = dnet_get_data();
-    int i;
-    if (!nd->has_last_results || nd->last_winner_id == 0xFF)
-        return "";
-    for (i = 0; i < nd->game_roster_count && i < DNET_MAX_PLAYERS; i++) {
-        if (nd->game_roster[i].active && nd->game_roster[i].id == nd->last_winner_id)
-            return nd->game_roster[i].name;
-    }
-    return "";
-}
-
 /* Draw Z-overlay: results or leaderboard */
 static void draw_z_overlay(const dnet_state_data_t* nd)
 {
@@ -370,24 +356,12 @@ void lobby_draw(void)
     }
 
     /* Player list - compact rows to fit up to 12 */
-    {
-        const char* winner_name = getWinnerName();
+    for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
+        int row = 10 + i;
+        const char* name = nd->lobby_players[i].name;
+        const char* ready_str = nd->lobby_players[i].ready ? "READY" : "---  ";
 
-        for (i = 0; i < nd->lobby_count && i < DNET_MAX_PLAYERS; i++) {
-            int row = 10 + i;
-            const char* name = nd->lobby_players[i].name;
-            const char* ready_str = nd->lobby_players[i].ready ? "READY" : "---  ";
-
-            jo_printf(3, row, "%-16s %-5s", name, ready_str);
-
-            /* Show WIN! next to the last game's winner — match by name since
-             * lobby id (user_id / 200+bot_id) differs from game_player_id */
-            if (winner_name[0] != '\0' && strcmp(name, winner_name) == 0) {
-                jo_printf(26, row, "WIN!");
-            } else {
-                jo_printf(26, row, "    ");
-            }
-        }
+        jo_printf(3, row, "%-16s %-5s    ", name, ready_str);
     }
 
     /* Clear remaining rows if fewer players than last draw */

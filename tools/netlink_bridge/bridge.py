@@ -30,12 +30,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("netlink_bridge")
 
-DEFAULT_BAUD = 9600
-DEFAULT_SERVER = "localhost:4821"
+DEFAULT_BAUD = 115200
+DEFAULT_SERVER = "saturncoup.duckdns.org:4822"
 DEFAULT_MOCK_PORT = 2337
 
 # Shared secret authentication (default; override with --secret)
-SHARED_SECRET = b"SaturnCoup2025!NetLink#SecretKey"
+SHARED_SECRET = b"SaturnDisasteroids2026!NetLink#Key"
 AUTH_MAGIC = b"AUTH"
 AUTH_OK = 0x01
 AUTH_TIMEOUT = 5.0  # seconds to wait for server response
