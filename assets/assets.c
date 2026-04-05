@@ -29,6 +29,17 @@ void loadPolygons(void)
     loadStars();
 }
 
+// workaround to enable wireframe mode
+void my_jo_3d_set_mesh_color_ex(jo_3d_mesh * const mesh, const jo_color color, bool wireframe)
+{
+    unsigned int i = 0;
+
+    for (JO_ZERO(i); i < mesh->data.nbPolygon; ++i)
+    {
+        jo_3d_set_mesh_polygon_color_ex(mesh, color, i, wireframe);
+    }
+}
+
 // initialize colors
 static void initColors(void)
 {
@@ -61,7 +72,7 @@ void drawLetter(char letter, int color, int x, int y, int xScale, int yScale)
     jo_3d_push_matrix();
     {
         jo_3d_camera_look_at(&g_Game.camera);
-        jo_3d_set_mesh_color(mesh, color);
+        my_jo_3d_set_mesh_color_ex(mesh, color, true);
         jo_3d_translate_matrix(x, y, 0);
         jo_3d_set_scale(xScale, yScale, 1);
         jo_3d_mesh_draw(mesh);
