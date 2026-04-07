@@ -31,6 +31,7 @@ static jo_3d_mesh* createV(void);
 static jo_3d_mesh* createW(void);
 static jo_3d_mesh* createX(void);
 static jo_3d_mesh* createY(void);
+static jo_3d_mesh* createZ(void);
 
 // digits 0-9
 static jo_3d_mesh* create0(void);
@@ -87,6 +88,7 @@ void loadAlphabet(void)
     g_Assets.letters[LETTER_TO_INDEX('W')] = createW();
     g_Assets.letters[LETTER_TO_INDEX('X')] = createX();
     g_Assets.letters[LETTER_TO_INDEX('Y')] = createY();
+    g_Assets.letters[LETTER_TO_INDEX('Z')] = createZ();
 }
 
 // digits
@@ -133,15 +135,14 @@ static jo_3d_mesh* createA(void)
 
 static jo_3d_mesh* createB(void)
 {
-    jo_3d_mesh* mesh = jo_3d_create_mesh(6);
+    jo_3d_mesh* mesh = jo_3d_create_mesh(5);
     int verticeIndex = 0;
 
-    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 4);
-    QUAD_LINE_SEGMENT(mesh, 0, 0, 3, 0);
-    QUAD_LINE_SEGMENT(mesh, 0, 4, 3, 4);
-    QUAD_LINE_SEGMENT(mesh, 0, 2, 4, 2);
-    QUAD_LINE_SEGMENT(mesh, 3, 0, 3, 2);
-    QUAD_LINE_SEGMENT(mesh, 3, 2, 3, 4);
+    QUAD_LINE_SEGMENT(mesh, 0, 4, 4, 4);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
+    QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
+    QUAD_LINE_SEGMENT(mesh, 1, 0, 1, 4);
+    QUAD_LINE_SEGMENT(mesh, 1, 2, 4, 2);
 
     return mesh;
 }
@@ -241,7 +242,7 @@ static jo_3d_mesh* createJ(void)
 
     QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
     QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
-    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 1);
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 2);
 
     return mesh;
 }
@@ -410,7 +411,7 @@ static jo_3d_mesh* createW(void)
     QUAD_LINE_SEGMENT(mesh, 0, 4, 0, 0);
     QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
     QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 4);
-    QUAD_LINE_SEGMENT(mesh, 2, 3, 2, 0)
+    QUAD_LINE_SEGMENT(mesh, 2, 2, 2, 0)
 
     return mesh;
 }
@@ -420,18 +421,11 @@ static jo_3d_mesh* createX(void)
     jo_3d_mesh* mesh = jo_3d_create_mesh(7);
     int verticeIndex = 0;
 
-    /* Stepped cross shape approximating X with H/V lines:
-     * |   |
-     *  | |
-     *  |-|
-     *  | |
-     * |   |
-     */
-    QUAD_LINE_SEGMENT(mesh, 0, 3, 0, 4);
-    QUAD_LINE_SEGMENT(mesh, 4, 3, 4, 4);
-    QUAD_LINE_SEGMENT(mesh, 1, 1, 1, 3);
-    QUAD_LINE_SEGMENT(mesh, 3, 1, 3, 3);
-    QUAD_LINE_SEGMENT(mesh, 1, 2, 3, 2);
+    QUAD_LINE_SEGMENT(mesh, 0, 4, 0, 3);
+    QUAD_LINE_SEGMENT(mesh, 4, 4, 4, 3);
+    QUAD_LINE_SEGMENT(mesh, 0, 3, 4, 3);
+    QUAD_LINE_SEGMENT(mesh, 2, 3, 2, 1)
+    QUAD_LINE_SEGMENT(mesh, 0, 1, 4, 1);
     QUAD_LINE_SEGMENT(mesh, 0, 0, 0, 1);
     QUAD_LINE_SEGMENT(mesh, 4, 0, 4, 1);
 
@@ -447,6 +441,20 @@ static jo_3d_mesh* createY(void)
     QUAD_LINE_SEGMENT(mesh, 4, 4, 4, 2);
     QUAD_LINE_SEGMENT(mesh, 0, 2, 4, 2);
     QUAD_LINE_SEGMENT(mesh, 2, 0, 2, 2);
+
+    return mesh;
+}
+
+static jo_3d_mesh* createZ(void)
+{
+    jo_3d_mesh* mesh = jo_3d_create_mesh(5);
+    int verticeIndex = 0;
+
+    QUAD_LINE_SEGMENT(mesh, 0, 0, 4, 0);
+    QUAD_LINE_SEGMENT(mesh, 4, 4, 4, 2);
+    QUAD_LINE_SEGMENT(mesh, 0, 2, 4, 2);
+    QUAD_LINE_SEGMENT(mesh, 0, 2, 0, 0);
+    QUAD_LINE_SEGMENT(mesh, 0, 4, 4, 4);
 
     return mesh;
 }
