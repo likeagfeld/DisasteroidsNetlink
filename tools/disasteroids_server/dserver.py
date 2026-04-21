@@ -19,17 +19,22 @@ Usage:
 """
 
 import argparse
+import base64
 import json
 import logging
 import math
 import os
+import queue
 import random
 import select
 import socket
 import struct
 import sys
+import threading
 import time
 import uuid
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -828,6 +833,8 @@ class BotPlayer:
         self.ai = BotAI(difficulty)
         self.last_sent_bits = -1
         self.force_send_counter = 0
+        # Tuning: SHIP_SYNC rate throttle
+        self.sync_tick_counter = 0
 
     def update_physics(self, bits: int):
         """Simple physics matching Saturn's ship model."""
@@ -874,6 +881,7 @@ class BotPlayer:
         self.ai = BotAI(self.difficulty)
         self.last_sent_bits = -1
         self.force_send_counter = 0
+        self.sync_tick_counter = 0
 
 
 # ==========================================================================
@@ -898,13 +906,28 @@ class ClientInfo:
         self.game_player_id = 0  # Assigned during GAME_START
         self.local_player_ids = []  # Additional local player IDs (dual controller)
         self.local_player_names = []  # Names for additional local players
+        # Tuning bookkeeping (SHIP_SYNC relay throttle)
+        self.ship_sync_relay_counter = 0
+        self.last_ship_sync_relay_tick = 0
+        # Egress telemetry (rolling window)
+        self._egress_bytes = 0
+        self._egress_window_start = time.time()
+        self._egress_rate = 0  # bytes/sec, updated once per window
 
     def send_raw(self, data: bytes) -> bool:
         try:
             self.socket.sendall(data)
-            return True
         except OSError:
             return False
+        # Count egress and roll the window
+        self._egress_bytes += len(data)
+        now = time.time()
+        elapsed = now - self._egress_window_start
+        if elapsed >= 1.0:
+            self._egress_rate = int(self._egress_bytes / elapsed)
+            self._egress_bytes = 0
+            self._egress_window_start = now
+        return True
 
 
 # ==========================================================================
@@ -914,7 +937,10 @@ class ClientInfo:
 
 class DisasteroidsServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 4822,
-                 num_bots: int = 0):
+                 num_bots: int = 0,
+                 admin_port: int = 0,
+                 admin_user: str = "admin",
+                 admin_password: str = "disast2026"):
         self.host = host
         self.port = port
         self.clients: dict = {}  # {socket: ClientInfo}
@@ -952,6 +978,69 @@ class DisasteroidsServer:
         # Tick timer for game simulation
         self._last_tick = 0.0
         self._tick_interval = 1.0 / GameSimulation.TICK_RATE
+        self._tick_counter = 0  # Monotonic server tick, used for keepalive bookkeeping
+
+        # --- Runtime-tunable bandwidth knobs (see admin /api/tuning) ---
+        # All defaults match pre-tuning behavior exactly (PASSTHROUGH).
+        self.tuning = {
+            "preset": "PASSTHROUGH",
+            "ship_sync_decimate": 1,           # relay every Nth SHIP_STATE per source
+            "ship_sync_skip_stationary": False,
+            "stationary_vel_threshold": 2,     # |dx|+|dy| below this = stationary
+            "ship_sync_keepalive_ticks": 60,   # force relay every N server ticks
+            "bot_sync_every_n_ticks": 1,       # 1=20Hz, 2=10Hz, 3≈7Hz, 4=5Hz
+        }
+        self._tuning_presets = {
+            "PASSTHROUGH": {
+                "ship_sync_decimate": 1,
+                "ship_sync_skip_stationary": False,
+                "stationary_vel_threshold": 2,
+                "ship_sync_keepalive_ticks": 60,
+                "bot_sync_every_n_ticks": 1,
+            },
+            "LIGHT": {
+                "ship_sync_decimate": 1,
+                "ship_sync_skip_stationary": True,
+                "stationary_vel_threshold": 2,
+                "ship_sync_keepalive_ticks": 60,
+                "bot_sync_every_n_ticks": 2,
+            },
+            "MODERATE": {
+                "ship_sync_decimate": 2,
+                "ship_sync_skip_stationary": True,
+                "stationary_vel_threshold": 2,
+                "ship_sync_keepalive_ticks": 45,
+                "bot_sync_every_n_ticks": 2,
+            },
+            "AGGRESSIVE": {
+                "ship_sync_decimate": 2,
+                "ship_sync_skip_stationary": True,
+                "stationary_vel_threshold": 3,
+                "ship_sync_keepalive_ticks": 30,
+                "bot_sync_every_n_ticks": 3,
+            },
+        }
+        # AUTO mode tracking
+        self._auto_mode = False          # when True, preset is re-selected on count change
+        self._auto_last_downgrade = 0.0  # timestamp of last candidate-downgrade (for hysteresis)
+        self._auto_current = "PASSTHROUGH"
+        self._AUTO_DOWNGRADE_HOLD = 10.0  # seconds of stable lower count before easing preset
+
+        # Per-client egress telemetry (rolling 1-second window)
+        self._egress_window = 1.0
+
+        # Admin HTTP portal
+        self._admin_port = admin_port
+        self._admin_user = admin_user
+        self._admin_password = admin_password
+        self._admin_command_queue = queue.Queue()
+        self._admin_httpd = None
+        self._admin_thread = None
+        self._start_time = time.time()
+        self._join_history = []
+        self._join_history_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "join_history.json")
+        self._load_join_history()
 
     def _load_leaderboard(self):
         """Load leaderboard from disk."""
@@ -1068,6 +1157,7 @@ class DisasteroidsServer:
 
         log.info("Disasteroids Server listening on %s:%d", self.host, self.port)
         self._running = True
+        self._start_admin_server()
         self._run()
 
     def _run(self):
@@ -1105,6 +1195,7 @@ class DisasteroidsServer:
 
             # Periodic tasks
             self._check_timeouts(now)
+            self._process_admin_commands()
 
     def _accept_connection(self):
         try:
@@ -1283,6 +1374,8 @@ class DisasteroidsServer:
                      client.username, client_uuid[:8])
             client.send_raw(build_welcome_back(
                 client.user_id, client.uuid, client.username))
+            self._log_join(client.username,
+                           "%s:%d" % client.address, "reconnect")
             self._broadcast_lobby_state()
             self._send_leaderboard_to_client(client)
         else:
@@ -1332,6 +1425,7 @@ class DisasteroidsServer:
 
         log.info("Player %d set username: %s", client.user_id, username)
         client.send_raw(build_welcome(client.user_id, client.uuid, username))
+        self._log_join(username, "%s:%d" % client.address, "join")
 
         # Let new player know if a game is in progress
         if self.game_active:
@@ -1501,6 +1595,7 @@ class DisasteroidsServer:
         self.game_active = True
         self.game_paused = False
         self._last_tick = time.time()
+        self._tick_counter = 0
 
         # Reset delta compression state for new game
         self.last_relayed_input.clear()
@@ -1561,6 +1656,9 @@ class DisasteroidsServer:
         for c in ready_players:
             for pid, name in roster:
                 c.send_raw(build_player_join(pid, name))
+
+        # Re-evaluate AUTO tuning preset for the live player count
+        self._evaluate_auto_preset()
 
         # Start first wave after a short delay for clients to init
         self._start_new_wave()
@@ -1648,11 +1746,28 @@ class DisasteroidsServer:
         if self.sim:
             self.sim.update_player_pos(player_id, x, y, dx, dy, flags)
 
-        # Relay as SHIP_SYNC to all other clients
-        sync_msg = build_ship_sync_raw(player_id, raw_data)
-        for s, c in self.clients.items():
-            if c.in_game and s != sock:
-                c.send_raw(sync_msg)
+        # Apply tuning gates (decimate + skip_stationary w/ keepalive).
+        # Defaults (PASSTHROUGH) make this block a no-op.
+        client.ship_sync_relay_counter += 1
+        should_relay = True
+        decimate = self.tuning["ship_sync_decimate"]
+        if decimate > 1:
+            if (client.ship_sync_relay_counter % decimate) != 0:
+                should_relay = False
+        if should_relay and self.tuning["ship_sync_skip_stationary"]:
+            vel_mag = abs(dx) + abs(dy)
+            ticks_since = self._tick_counter - client.last_ship_sync_relay_tick
+            keepalive = self.tuning["ship_sync_keepalive_ticks"]
+            threshold = self.tuning["stationary_vel_threshold"]
+            if vel_mag < threshold and ticks_since < keepalive:
+                should_relay = False
+
+        if should_relay:
+            sync_msg = build_ship_sync_raw(player_id, raw_data)
+            for s, c in self.clients.items():
+                if c.in_game and s != sock:
+                    c.send_raw(sync_msg)
+            client.last_ship_sync_relay_tick = self._tick_counter
 
     def _handle_asteroid_hit(self, sock, client: ClientInfo, payload: bytes):
         if not self.game_active or not client.in_game or not self.sim:
@@ -1725,6 +1840,11 @@ class DisasteroidsServer:
         if not self.sim:
             return
 
+        self._tick_counter += 1
+        # AUTO mode: re-evaluate once per second (20 ticks) so the
+        # downgrade hysteresis can expire without relying on an event.
+        if self._auto_mode and (self._tick_counter % 20) == 0:
+            self._evaluate_auto_preset()
         events = self.sim.tick()
         for evt in events:
             if evt[0] == "wave_over":
@@ -1778,8 +1898,11 @@ class DisasteroidsServer:
                 bot.last_sent_bits = bits
                 bot.force_send_counter = 0
 
-            # Relay bot ship state periodically (every ~10 frames = 0.5s at 20 tick rate)
-            if True:  # send every tick (~3 Saturn frames) for smooth bot movement
+            # Relay bot ship state, throttled by tuning.bot_sync_every_n_ticks.
+            # Default (1) = every tick (~20 Hz) matching pre-tuning behavior.
+            bot.sync_tick_counter += 1
+            bot_sync_every_n = max(1, int(self.tuning["bot_sync_every_n_ticks"]))
+            if (bot.sync_tick_counter % bot_sync_every_n) == 0:
                 sync_msg = build_ship_sync(
                     bot.game_player_id, bot.x, bot.y,
                     bot.dx, bot.dy, bot.rot & 0x7FFF, flags)
@@ -1924,6 +2047,10 @@ class DisasteroidsServer:
         if client:
             log.info("Removing %s (%s): %s",
                      client.username or "unknown", client.address, reason)
+            if client.authenticated and client.username:
+                event = "kicked-by-admin" if reason == "kicked by admin" else "leave"
+                self._log_join(client.username,
+                               "%s:%d" % client.address, event)
 
             if client.in_game and self.game_active and self.sim:
                 # Mark this player (and their local extras) as dead in the sim
@@ -1964,6 +2091,8 @@ class DisasteroidsServer:
                 client.ready = False
 
             del self.clients[sock]
+            # Re-evaluate AUTO tuning preset after player count changes.
+            self._evaluate_auto_preset()
         else:
             log.info("Removing unknown socket: %s", reason)
 
@@ -2011,6 +2140,419 @@ class DisasteroidsServer:
             if now - client.last_activity > HEARTBEAT_TIMEOUT:
                 self._remove_client(sock, "heartbeat timeout")
 
+    # ------------------------------------------------------------------
+    # Admin portal
+    # ------------------------------------------------------------------
+
+    def _load_join_history(self):
+        try:
+            if os.path.exists(self._join_history_path):
+                with open(self._join_history_path, "r") as f:
+                    self._join_history = json.load(f)
+        except Exception as e:
+            log.warning("Failed to load join history: %s", e)
+            self._join_history = []
+
+    def _save_join_history(self):
+        try:
+            if len(self._join_history) > 1000:
+                self._join_history = self._join_history[-1000:]
+            with open(self._join_history_path, "w") as f:
+                json.dump(self._join_history, f, indent=2)
+        except Exception as e:
+            log.warning("Failed to save join history: %s", e)
+
+    def _log_join(self, name: str, ip: str, event: str):
+        self._join_history.append({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "name": name, "ip": ip, "event": event,
+        })
+        self._save_join_history()
+
+    # ------------------------------------------------------------------
+    # Tuning helpers
+    # ------------------------------------------------------------------
+
+    def _apply_tune_command(self, data: dict):
+        """Apply a validated tuning command from the admin queue.
+
+        `data` may contain `preset` (including "AUTO" / "CUSTOM") and/or
+        individual knob overrides. Setting any individual knob switches
+        preset to CUSTOM. Setting preset=AUTO enables AUTO mode and
+        immediately re-evaluates.
+        """
+        if not isinstance(data, dict):
+            return
+        preset = data.get("preset")
+        individual_keys = [k for k in data.keys() if k != "preset"]
+
+        if preset == "AUTO":
+            # Enable AUTO and snap to the target preset immediately; hysteresis
+            # only applies to count changes during ongoing AUTO operation.
+            self._auto_mode = True
+            self._auto_last_downgrade = 0.0
+            n = self._current_player_count()
+            target = self._auto_select_preset(n)
+            self._apply_tuning_preset(target, from_auto=True)
+            log.info("Tuning: AUTO mode enabled, snapped to %s (n=%d)",
+                     target, n)
+            return
+
+        if preset and preset != "CUSTOM":
+            # Named preset bundle — apply and disable AUTO.
+            self._apply_tuning_preset(preset, from_auto=False)
+
+        if individual_keys:
+            # Individual knob overrides — disable AUTO, mark as CUSTOM.
+            for key in individual_keys:
+                self.tuning[key] = data[key]
+            self.tuning["preset"] = "CUSTOM"
+            self._auto_mode = False
+            self._auto_current = "CUSTOM"
+            log.info("Tuning: CUSTOM (knobs: %s)",
+                     ", ".join("%s=%s" % (k, data[k]) for k in individual_keys))
+
+    def _apply_tuning_preset(self, preset_name: str,
+                             from_auto: bool = False) -> bool:
+        """Apply a preset bundle to self.tuning. Returns True on success."""
+        bundle = self._tuning_presets.get(preset_name)
+        if bundle is None:
+            return False
+        for k, v in bundle.items():
+            self.tuning[k] = v
+        self.tuning["preset"] = preset_name
+        if not from_auto:
+            # Manual preset selection disables AUTO until user re-enables it.
+            self._auto_mode = False
+        self._auto_current = preset_name
+        log.info("Tuning preset applied: %s%s",
+                 preset_name, " (via AUTO)" if from_auto else "")
+        return True
+
+    def _current_player_count(self) -> int:
+        """Humans (in-game) + bots (in-game) — count against bandwidth ceiling."""
+        humans = sum(1 for c in self.clients.values()
+                     if c.in_game and c.authenticated)
+        human_locals = sum(len(c.local_player_ids) for c in self.clients.values()
+                           if c.in_game)
+        bots = sum(1 for b in self.bots if b.in_game)
+        return humans + human_locals + bots
+
+    def _auto_select_preset(self, n: int) -> str:
+        if n <= 4:
+            return "PASSTHROUGH"
+        if n <= 6:
+            return "LIGHT"
+        if n <= 8:
+            return "MODERATE"
+        return "AGGRESSIVE"
+
+    # Preset severity ordering (higher = more aggressive).
+    _PRESET_RANK = {
+        "PASSTHROUGH": 0,
+        "LIGHT": 1,
+        "MODERATE": 2,
+        "AGGRESSIVE": 3,
+    }
+
+    def _evaluate_auto_preset(self):
+        """Re-evaluate AUTO preset based on live player count.
+
+        Upgrade (more aggressive) applies immediately.
+        Downgrade (less aggressive) applies only after the lower count has
+        been stable for self._AUTO_DOWNGRADE_HOLD seconds.
+        """
+        if not self._auto_mode:
+            return
+        n = self._current_player_count()
+        target = self._auto_select_preset(n)
+        current = self._auto_current
+        if target == current:
+            self._auto_last_downgrade = 0.0
+            return
+        cur_rank = self._PRESET_RANK.get(current, 0)
+        tgt_rank = self._PRESET_RANK.get(target, 0)
+        now = time.time()
+        if tgt_rank > cur_rank:
+            # Upgrade immediately (bandwidth pressure is rising).
+            self._apply_tuning_preset(target, from_auto=True)
+            self._auto_last_downgrade = 0.0
+            log.info("AUTO: upgraded %s -> %s (n=%d)", current, target, n)
+        else:
+            # Candidate downgrade — require stable hold period.
+            if self._auto_last_downgrade == 0.0:
+                self._auto_last_downgrade = now
+                return
+            if (now - self._auto_last_downgrade) >= self._AUTO_DOWNGRADE_HOLD:
+                self._apply_tuning_preset(target, from_auto=True)
+                self._auto_last_downgrade = 0.0
+                log.info("AUTO: downgraded %s -> %s (n=%d, stable for %.1fs)",
+                         current, target, n, self._AUTO_DOWNGRADE_HOLD)
+
+    def _start_admin_server(self):
+        if not self._admin_port:
+            return
+        handler_class = _make_disast_admin_handler(self)
+        try:
+            self._admin_httpd = ThreadingHTTPServer(
+                ("0.0.0.0", self._admin_port), handler_class)
+            self._admin_httpd.daemon_threads = True
+        except OSError as e:
+            log.error("Failed to start admin server on port %d: %s",
+                      self._admin_port, e)
+            return
+        self._admin_thread = threading.Thread(
+            target=self._admin_httpd.serve_forever, daemon=True)
+        self._admin_thread.start()
+        log.info("Admin portal listening on http://0.0.0.0:%d/",
+                 self._admin_port)
+
+    def _process_admin_commands(self):
+        while True:
+            try:
+                cmd = self._admin_command_queue.get_nowait()
+            except queue.Empty:
+                break
+            action = cmd.get("cmd", "")
+            if action == "kick":
+                target_uuid = cmd.get("uuid", "")
+                for sock, info in list(self.clients.items()):
+                    if info.uuid == target_uuid:
+                        log.info("Admin kicked %s", info.username)
+                        self._remove_client(sock, "kicked by admin")
+                        break
+            elif action == "end_game":
+                if self.game_active and self.sim:
+                    log.info("Admin ended game")
+                    self.sim.game_over = True
+            elif action == "restart":
+                log.info("Admin requested restart")
+                self._running = False
+            elif action == "tune":
+                self._apply_tune_command(cmd.get("data", {}))
+
+    def _build_admin_state(self):
+        now = time.time()
+        players = []
+        for sock, info in list(self.clients.items()):
+            if not info.authenticated:
+                continue
+            score = 0
+            deaths = 0
+            status = "lobby"
+            if info.in_game and self.sim:
+                pid = info.game_player_id
+                score = int(self.sim.scores.get(pid, 0))
+                p = self.sim.players.get(pid)
+                if p and p.get("alive"):
+                    status = "in-game"
+                else:
+                    status = "dead"
+                    deaths = 1
+            players.append({
+                "username": info.username,
+                "uuid": info.uuid,
+                "status": status,
+                "address": "%s:%d" % info.address,
+                "idle": round(now - info.last_activity, 1),
+                "ready": info.ready,
+                "score": score,
+                "deaths": deaths,
+                "egress_bps": getattr(info, "_egress_rate", 0),
+            })
+        game = {
+            "active": self.game_active,
+            "phase": "Playing" if self.game_active else "Lobby",
+            "human_count": sum(1 for c in self.clients.values()
+                               if c.authenticated),
+            "bot_count": len(self.bots),
+            "wave": self.sim.wave if (self.game_active and self.sim) else 0,
+            "asteroids_left": sum(1 for a in self.sim.asteroids
+                                  if a is not None and a["alive"])
+                              if (self.game_active and self.sim) else 0,
+            "ships_alive": sum(1 for p in self.sim.players.values()
+                               if p.get("alive"))
+                           if (self.game_active and self.sim) else 0,
+            "game_type": ("Co-op" if self.game_type == GAME_TYPE_COOP
+                          else "Versus") if self.game_active else "-",
+        }
+        tuning = {
+            **self.tuning,
+            "auto_mode": self._auto_mode,
+            "auto_current": self._auto_current,
+            "player_count": self._current_player_count(),
+        }
+        return {
+            "uptime": round(now - self._start_time, 1),
+            "total_joins": len(self._join_history),
+            "players": players,
+            "game": game,
+            "tuning": tuning,
+        }
+
+
+ADMIN_HTML_STUB = b"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Disasteroids Admin</title></head><body style="font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:24px">
+<h1>Disasteroids Admin</h1>
+<p>This service exposes the Disasteroids admin JSON API.</p>
+<p>Visit <a style="color:#f5a623" href="/admin/">the unified Saturn admin portal</a> for the dashboard.</p>
+</body></html>"""
+
+
+_TUNING_INT_RANGES = {
+    "ship_sync_decimate":        (1, 4),
+    "stationary_vel_threshold":  (0, 50),
+    "ship_sync_keepalive_ticks": (15, 120),
+    "bot_sync_every_n_ticks":    (1, 4),
+}
+_TUNING_BOOL_KEYS = {"ship_sync_skip_stationary"}
+
+
+def _validate_tuning_update(data, presets):
+    """Validate a POST /api/tuning payload. Returns (ok, error_msg)."""
+    if not isinstance(data, dict):
+        return False, "payload must be a JSON object"
+    preset = data.get("preset")
+    if preset is not None:
+        valid_presets = set(presets.keys()) | {"AUTO", "CUSTOM"}
+        if preset not in valid_presets:
+            return False, "unknown preset: %s" % preset
+    for key, val in data.items():
+        if key in ("preset",):
+            continue
+        if key in _TUNING_INT_RANGES:
+            lo, hi = _TUNING_INT_RANGES[key]
+            if not isinstance(val, int) or isinstance(val, bool):
+                return False, "%s must be int" % key
+            if val < lo or val > hi:
+                return False, "%s out of range [%d,%d]" % (key, lo, hi)
+        elif key in _TUNING_BOOL_KEYS:
+            if not isinstance(val, bool):
+                return False, "%s must be bool" % key
+        else:
+            return False, "unknown key: %s" % key
+    return True, ""
+
+
+def _make_disast_admin_handler(server_ref):
+    class DisastAdminHandler(BaseHTTPRequestHandler):
+        srv = server_ref
+
+        def log_message(self, fmt, *args):
+            log.debug("Admin HTTP: " + fmt, *args)
+
+        def _check_auth(self):
+            if self.headers.get("X-Admin-Auth") == "nginx-verified":
+                return True
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith("Basic "):
+                self._send_auth_required()
+                return False
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                user, pwd = decoded.split(":", 1)
+            except Exception:
+                self._send_auth_required()
+                return False
+            srv = self.srv
+            if user != srv._admin_user or pwd != srv._admin_password:
+                self._send_auth_required()
+                return False
+            return True
+
+        def _send_auth_required(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate",
+                             'Basic realm="Disasteroids Admin"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "12")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"Unauthorized")
+            self.close_connection = True
+
+        def _send_json(self, data, code=200):
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def do_GET(self):
+            if not self._check_auth():
+                return
+            path = urlparse(self.path).path
+            if path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(ADMIN_HTML_STUB)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(ADMIN_HTML_STUB)
+                self.close_connection = True
+            elif path == "/api/state":
+                self._send_json(self.srv._build_admin_state())
+            elif path == "/api/history":
+                entries = list(self.srv._join_history[-200:])
+                entries.reverse()
+                self._send_json({"entries": entries})
+            elif path == "/api/tuning":
+                srv = self.srv
+                presets = list(srv._tuning_presets.keys()) + ["AUTO", "CUSTOM"]
+                self._send_json({
+                    "tuning": dict(srv.tuning),
+                    "auto_mode": srv._auto_mode,
+                    "auto_current": srv._auto_current,
+                    "player_count": srv._current_player_count(),
+                    "presets": presets,
+                    "preset_bundles": srv._tuning_presets,
+                })
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            if not self._check_auth():
+                return
+            path = urlparse(self.path).path
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b""
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                data = {}
+            srv = self.srv
+            if path == "/api/kick":
+                target_uuid = data.get("uuid", "")
+                if not target_uuid:
+                    self._send_json({"error": "missing uuid"}, 400)
+                    return
+                srv._admin_command_queue.put(
+                    {"cmd": "kick", "uuid": target_uuid})
+                self._send_json({"message": "Kick queued"})
+            elif path == "/api/end_game":
+                srv._admin_command_queue.put({"cmd": "end_game"})
+                self._send_json({"message": "End game queued"})
+            elif path == "/api/restart":
+                srv._admin_command_queue.put({"cmd": "restart"})
+                self._send_json({"message": "Restart queued"})
+            elif path == "/api/tuning":
+                # Validate incoming fields up front so bad input is rejected
+                # without ever reaching the game loop.
+                valid, error = _validate_tuning_update(data,
+                                                       srv._tuning_presets)
+                if not valid:
+                    self._send_json({"error": error}, 400)
+                    return
+                srv._admin_command_queue.put({"cmd": "tune", "data": data})
+                self._send_json({"message": "Tuning queued"})
+            else:
+                self.send_error(404)
+
+    return DisastAdminHandler
+
 
 # ==========================================================================
 # CLI
@@ -2023,6 +2565,12 @@ def main():
     parser.add_argument("--port", type=int, default=4822, help="Bind port")
     parser.add_argument("--bots", type=int, default=0,
                         help="Number of server-side bot players (0-11)")
+    parser.add_argument("--admin-port", type=int, default=0,
+                        help="Admin HTTP port (0=disabled)")
+    parser.add_argument("--admin-user", default="admin",
+                        help="Admin username (for direct-port access)")
+    parser.add_argument("--admin-password", default="disast2026",
+                        help="Admin password (for direct-port access)")
     parser.add_argument("--verbose", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
@@ -2030,7 +2578,10 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     server = DisasteroidsServer(host=args.host, port=args.port,
-                                num_bots=args.bots)
+                                num_bots=args.bots,
+                                admin_port=args.admin_port,
+                                admin_user=args.admin_user,
+                                admin_password=args.admin_password)
     if args.bots > 0:
         log.info("Starting with %d bot(s): %s", args.bots,
                  ", ".join(b.name for b in server.bots))

@@ -1,0 +1,24 @@
+# Build artifacts (Jo Engine / SGL output)
+*.o
+*.elf
+*.iso
+*.raw
+*.map
+*.bin
+cd/0.bin
+game.cue
+Game Files/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Server-side persistence (written by dserver.py at runtime, not source)
+tools/disasteroids_server/leaderboard.json
+tools/disasteroids_server/join_history.json

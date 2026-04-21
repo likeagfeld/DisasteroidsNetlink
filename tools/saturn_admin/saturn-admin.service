@@ -1,0 +1,16 @@
+[Unit]
+Description=Saturn NetLink Unified Admin Portal
+After=network.target coup-server.service flock-server.service disasteroids.service
+
+[Service]
+Type=simple
+User=gary
+WorkingDirectory=/opt/saturn-admin
+ExecStart=/usr/bin/python3 /opt/saturn-admin/unified_admin.py --host 127.0.0.1 --port 9099
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
