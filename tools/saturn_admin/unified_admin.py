@@ -377,36 +377,76 @@ function renderPlayers(slug,players){
 
 // ------- Tuning: fetch, render, estimate, apply -------
 var tuningCache={};  // slug -> last /api/tuning payload
+var tuningDirty={};  // slug -> true when user has pending (un-Applied) changes
 var CEILING_BPS=1440;  // 14,400 baud / 10 bits per byte
+
+function markTuningDirty(slug){
+  tuningDirty[slug]=true;
+  var tp=$('.tuning-panel',panel(slug));
+  if(tp)$('.tuning-badge',tp).textContent+=' (pending — click Apply)';
+}
+
+function wireTuningInputs(slug){
+  var tp=$('.tuning-panel',panel(slug));
+  if(!tp||tp.__wired)return;
+  tp.__wired=true;
+  $$('input[name=preset-'+slug+']',tp).forEach(function(r){
+    r.addEventListener('change',function(){markTuningDirty(slug);});
+  });
+  $$('input[data-key]',tp).forEach(function(inp){
+    inp.addEventListener('change',function(){markTuningDirty(slug);});
+    inp.addEventListener('input', function(){markTuningDirty(slug);});
+  });
+}
 
 function renderTuning(slug,t){
   var pane=panel(slug);
   var tp=$('.tuning-panel',pane);
   if(!tp||!t||!t.tuning)return;
+  wireTuningInputs(slug);
   tuningCache[slug]=t;
   var tuning=t.tuning;
   var presetShown=t.auto_mode?'AUTO':(tuning.preset||'PASSTHROUGH');
-  // Radio selection
-  $$('input[name=preset-'+slug+']',tp).forEach(function(r){
-    r.checked=(r.value===presetShown);
-  });
-  // Badge
+  var dirty=!!tuningDirty[slug];
+  // Radio selection — skip when user has pending changes so we don't
+  // overwrite an in-progress selection on the 3-second refresh.
+  if(!dirty){
+    $$('input[name=preset-'+slug+']',tp).forEach(function(r){
+      r.checked=(r.value===presetShown);
+    });
+  }
+  // Badge — always reflects live server state
   var badge=$('.tuning-badge',tp);
   badge.className='tuning-badge b-'+presetShown.toLowerCase();
+  var badgeText;
   if(t.auto_mode && t.auto_current && t.auto_current!=='AUTO'){
-    badge.textContent='AUTO → '+t.auto_current+' (n='+(t.player_count||0)+')';
+    badgeText='AUTO → '+t.auto_current+' (n='+(t.player_count||0)+')';
   }else{
-    badge.textContent=presetShown+' (n='+(t.player_count||0)+')';
+    badgeText=presetShown+' (n='+(t.player_count||0)+')';
   }
-  // Advanced knobs
-  $$('input[data-key]',tp).forEach(function(inp){
-    var key=inp.getAttribute('data-key');
-    var v=tuning[key];
-    if(inp.type==='checkbox'){inp.checked=!!v;}
-    else{inp.value=(v==null?'':v);}
-    inp.disabled=(presetShown!=='CUSTOM');
-  });
-  // Estimate
+  if(dirty)badgeText+=' (pending — click Apply)';
+  badge.textContent=badgeText;
+  // Advanced knobs — skip when dirty
+  if(!dirty){
+    $$('input[data-key]',tp).forEach(function(inp){
+      var key=inp.getAttribute('data-key');
+      var v=tuning[key];
+      if(inp.type==='checkbox'){inp.checked=!!v;}
+      else{inp.value=(v==null?'':v);}
+      inp.disabled=(presetShown!=='CUSTOM');
+    });
+  }else{
+    // When dirty, enable all knobs so the user can edit in CUSTOM mode
+    // without the UI disabling them mid-edit.
+    var customSelected=false;
+    $$('input[name=preset-'+slug+']',tp).forEach(function(r){
+      if(r.checked&&r.value==='CUSTOM')customSelected=true;
+    });
+    $$('input[data-key]',tp).forEach(function(inp){
+      inp.disabled=!customSelected;
+    });
+  }
+  // Estimate — always live
   $('.tuning-estimate',tp).textContent=estimateBandwidth(t);
 }
 
@@ -446,7 +486,8 @@ function applyTuning(slug){
   api('POST',slug,'tuning',body).then(function(r){
     if(r.error){showMsg('Tuning error: '+r.error,'#d32f2f');return;}
     showMsg(r.message||'Tuning applied');
-    // Refresh tuning state right away for visible feedback.
+    // Clear dirty so the next refresh shows the server's view, not the user's.
+    tuningDirty[slug]=false;
     refreshTuning(slug);
   }).catch(function(e){showMsg('Tuning failed: '+e.message,'#d32f2f');});
 }
@@ -455,6 +496,7 @@ function applyTuningPreset(slug,preset){
   api('POST',slug,'tuning',{preset:preset}).then(function(r){
     if(r.error){showMsg('Tuning error: '+r.error,'#d32f2f');return;}
     showMsg(r.message||'Tuning applied');
+    tuningDirty[slug]=false;
     refreshTuning(slug);
   }).catch(function(e){showMsg('Tuning failed: '+e.message,'#d32f2f');});
 }
