@@ -4,8 +4,6 @@
 
 ---
 
-# Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude).
-
 ## Online Multiplayer (NetLink)
 Disasteroids now supports online multiplayer via the Sega Saturn NetLink modem. Up to 12 players can connect to a central server and play cooperatively or competitively over the internet.
 
@@ -51,7 +49,7 @@ If you have a [DreamPi](https://github.com/Kazade/dreampi) (Raspberry Pi with US
    ```bash
    sudo cp tools/dreampi/config.ini /opt/dreampi/config.ini
    ```
-3. Edit `/opt/dreampi/config.ini` if you need to change the server host/port (defaults point to `saturncoup.duckdns.org:4822`)
+3. Edit `/opt/dreampi/config.ini` if you need to change the server host/port (defaults point to )
 4. Restart DreamPi:
    ```bash
    sudo systemctl restart dreampi
@@ -75,21 +73,13 @@ If you don't have a DreamPi, you can connect a USB modem directly to a PC and us
 **Linux / macOS / manual:**
 
 3. Run the bridge:
-   ```bash
-   cd tools/netlink_bridge
-   python bridge.py --serial-port /dev/ttyUSB0 --server saturncoup.duckdns.org:4822 --secret "SaturnDisasteroids2026!NetLink#Key"
-   ```
+   
 
 The bridge listens for the Saturn's dial-out, answers the call, and tunnels data to the game server over TCP.
 
 ### Server Setup
 
 The Python game server is in `tools/disasteroids_server/`:
-
-```bash
-cd tools/disasteroids_server
-python dserver.py --port 4822 --bots 2
-```
 
 Options:
 - `--port PORT` — TCP listen port (default: 4822)
@@ -159,4 +149,3 @@ Game Over Song: [Dub Hub](https://www.youtube.com/watch?v=in8hEbX9mM8) by Jimmy 
 Thank you to [Emerald Nova](www.emeraldnova.com) for organizing the Saturn Dev contest  
 [SegaXtreme](http://www.segaxtreme.net/) - The best Sega Saturn development forum on the web. Thank you for all the advice from all the great posters on the forum.  
 [Jo Engine](https://github.com/johannes-fetz/joengine) - Sega Saturn dev environment
-
