@@ -82,7 +82,6 @@ The bridge listens for the Saturn's dial-out, answers the call, and tunnels data
 The Python game server is in `tools/disasteroids_server/`:
 
 Options:
-- `--port PORT` — TCP listen port (default: 4822)
 - `--bots N` — Number of AI bot players to add (default: 0)
 - `--secret KEY` — Shared secret for client authentication (must match config.ini/bridge)
 
