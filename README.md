@@ -1,3 +1,9 @@
+# Disasteroids — NetLink Edition
+
+> 💝 **Huge thanks to [Slinga](https://github.com/slinga-homebrew)** for the original Disasteroids — the engine, the meshes, the CD audio, the entire 12-player Saturn Asteroids clone that made this port possible. This fork adds networking on top of Slinga's work; every line of the original game and every asset is theirs. If you enjoy this online port, go star the upstream repo: https://github.com/slinga-homebrew/Disasteroids
+
+---
+
 # Disclaimer - Online Netlink functionality has been implemented with assistance of AI (Claude).
 
 ## Online Multiplayer (NetLink)
