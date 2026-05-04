@@ -2075,12 +2075,20 @@ class DisasteroidsServer:
         self._send_sync_mode_to(client, force=True)
 
     def _send_sync_mode_to(self, client: ClientInfo, force: bool = False):
-        """Send DNET_MSG_SET_SYNC_MODE to one client if needed. RING mode is
-        only honored on clients that announced ring support; everyone else
-        gets LERP unconditionally (so old clients never see anything but
-        the raw 22-byte SHIP_SYNC they were built to parse)."""
+        """Send DNET_MSG_SET_SYNC_MODE to one client if needed.
+
+        RING mode is only honored on clients that announced ring support;
+        everyone else gets LERP unconditionally (so old clients never see
+        anything but the raw 22-byte SHIP_SYNC they were built to parse).
+
+        Old (pre-1.1.0) clients never announced CLIENT_CAPS — they would
+        also silently ignore SET_SYNC_MODE via their default-case
+        dispatcher. We skip sending it to them at all to save 4 bytes
+        on the wire per toggle change."""
+        if not client.supports_ring:
+            return
         global_mode = self.tuning.get("sync_mode", "LERP")
-        effective = global_mode if client.supports_ring else "LERP"
+        effective = global_mode  # ring-capable, so just adopt global mode
         if not force and client.last_sent_sync_mode == effective:
             return
         client.send_raw(build_set_sync_mode(effective))
