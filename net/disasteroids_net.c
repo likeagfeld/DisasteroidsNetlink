@@ -697,6 +697,83 @@ uint8_t dnet_get_sync_mode(void)
     return g_net.sync_mode;
 }
 
+/* Process ASTEROID_SYNC: periodic position correction for active asteroids.
+ *
+ * Server only sends this when sync_mode==RING and tuning.asteroid_sync_correct
+ * is on, and only to clients that announced ring support — so old binaries
+ * (no CLIENT_CAPS) never see this message and follow the v1.0.0/v1.1.0
+ * deterministic-only path.
+ *
+ * Wire: [type:1][count:1]{slot:1, x:4, y:4, dx:4, dy:4}xN.
+ *
+ * Behavior per asteroid:
+ *   - INACTIVE locally → ignore (we already destroyed it, server's view
+ *     is stale and another DESTROY message is in flight)
+ *   - ACTIVE locally → snap velocity unconditionally (server is the
+ *     authority on dx/dy), then position correction:
+ *       drift < 3 px (wrap-aware) → snap directly (invisible to user)
+ *       drift >= 3 px            → 75% lerp toward server pos (smooth)
+ *
+ * Mirrors the same snap-vs-lerp threshold and wrap-aware delta arithmetic
+ * as process_ship_sync (LERP path) so visual behavior is consistent. */
+static void process_asteroid_sync(const uint8_t* payload, int len)
+{
+    uint8_t count;
+    int off, i;
+
+    /* [type:1][count:1]{17 bytes per entry} */
+    if (len < 2) return;
+    count = payload[1];
+    off = 2;
+
+    for (i = 0; i < count; i++) {
+        uint8_t slot;
+        jo_fixed sx, sy, sdx, sdy;
+        PDISASTEROID a;
+        jo_fixed dx_pos, dy_pos;
+
+        if (off + 17 > len) break;
+        slot = payload[off + 0];
+        sx  = (jo_fixed)read_i32(&payload[off + 1]);
+        sy  = (jo_fixed)read_i32(&payload[off + 5]);
+        sdx = (jo_fixed)read_i32(&payload[off + 9]);
+        sdy = (jo_fixed)read_i32(&payload[off + 13]);
+        off += 17;
+
+        if (slot >= MAX_DISASTEROIDS) continue;
+        a = &g_Disasteroids[slot];
+        if (a->objectState != OBJECT_STATE_ACTIVE) continue;
+
+        /* Server is authoritative on velocity — always adopt. The next
+         * frame's local advance will then propagate position from here. */
+        a->curPos.dx = sdx;
+        a->curPos.dy = sdy;
+
+        /* Position correction. Wrap-aware delta: if the apparent delta is
+         * larger than half the screen, the asteroid actually wrapped, so
+         * the short-way delta is the one we want to lerp along. */
+        dx_pos = sx - a->curPos.x;
+        dy_pos = sy - a->curPos.y;
+        if (dx_pos > SCREEN_MAX_X)       dx_pos -= (SCREEN_MAX_X - SCREEN_MIN_X);
+        else if (dx_pos < SCREEN_MIN_X)  dx_pos += (SCREEN_MAX_X - SCREEN_MIN_X);
+        if (dy_pos > SCREEN_MAX_Y)       dy_pos -= (SCREEN_MAX_Y - SCREEN_MIN_Y);
+        else if (dy_pos < SCREEN_MIN_Y)  dy_pos += (SCREEN_MAX_Y - SCREEN_MIN_Y);
+
+        if (JO_ABS(dx_pos) < toFIXED(3) && JO_ABS(dy_pos) < toFIXED(3)) {
+            /* Sub-3-pixel drift → snap silently (imperceptible). */
+            a->curPos.x = sx;
+            a->curPos.y = sy;
+        } else {
+            /* Larger drift → 75% lerp toward server position. The lerp is
+             * applied this frame; subsequent frames advance the asteroid
+             * normally with the freshly-snapped velocity. After ~3 frames
+             * any remaining residual is below the snap threshold. */
+            a->curPos.x += dx_pos - (dx_pos >> 2);
+            a->curPos.y += dy_pos - (dy_pos >> 2);
+        }
+    }
+}
+
 static void process_asteroid_spawn(const uint8_t* payload, int len)
 {
     /* [type:1][slot:1][x:4][y:4][dx:4][dy:4][size:1][type:1] = 20 */
@@ -1011,6 +1088,10 @@ static void process_message(const uint8_t* payload, int len)
 
     case DNET_MSG_SET_SYNC_MODE:
         process_set_sync_mode(payload, len);
+        break;
+
+    case DNET_MSG_ASTEROID_SYNC:
+        process_asteroid_sync(payload, len);
         break;
 
     case DNET_MSG_ASTEROID_SPAWN:

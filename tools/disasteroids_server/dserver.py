@@ -108,6 +108,7 @@ DNET_MSG_LOCAL_PLAYER_ACK = 0x86
 DNET_MSG_LEADERBOARD_DATA = 0xAF
 DNET_MSG_SET_SYNC_MODE = 0xB0  # [mode:1] (0=LERP, 1=RING)
 DNET_MSG_SHIP_SYNC_Q = 0xB1    # quantized SHIP_SYNC (12-byte payload)
+DNET_MSG_ASTEROID_SYNC = 0xB2  # periodic asteroid position correction
 
 # Sync-mode wire constants. MUST match Saturn-side DNET_SYNC_MODE_* in
 # disasteroids_protocol.h. Stored as strings in self.tuning for human-friendly
@@ -356,6 +357,30 @@ def build_set_sync_mode(mode_str: str) -> bytes:
     return encode_frame(payload)
 
 
+def build_asteroid_sync(entries) -> bytes:
+    """Periodic asteroid position correction (RING + asteroid_sync_correct).
+
+    `entries` is an iterable of (slot, x, y, dx, dy) tuples. Wire format:
+    [type:1=0xB2][count:1]{slot:1,x:4 BE,y:4 BE,dx:4 BE,dy:4 BE}xN
+
+    Bandwidth bounded: at MAX_DISASTEROIDS=12 active asteroids,
+    payload = 1 + 1 + 12*17 = 206 bytes; sent every 30 ticks (1.5 s)
+    = ~137 B/s — small fraction of the 1440 B/s modem ceiling.
+    """
+    parts = [bytes([DNET_MSG_ASTEROID_SYNC])]
+    n = 0
+    body = b""
+    for slot, x, y, dx, dy in entries:
+        body += bytes([slot & 0xFF])
+        body += struct.pack("!iiii", x, y, dx, dy)
+        n += 1
+        if n >= 255:
+            break
+    parts.append(bytes([n & 0xFF]))
+    parts.append(body)
+    return encode_frame(b"".join(parts))
+
+
 def _q_parity_selftest():
     """Round-trip a representative set of values through quantize→dequantize
     and verify error is within the documented precision. Run at startup so
@@ -408,6 +433,68 @@ def _q_parity_selftest():
 
 def _sync_mode_byte(mode_str: str) -> int:
     return SYNC_MODE_BYTE.get(mode_str, 0)
+
+
+def _asteroid_sync_selftest():
+    """v1.1.1 — sanity-check the asteroid drift correction subsystem.
+
+    Three parts:
+      1. Saturn-matching edge-snap wrap places overshoots at the opposite
+         edge exactly (matches Saturn `boundGameplayObject`).
+      2. build_asteroid_sync round-trip — emit then manually decode and
+         verify field-by-field, so a future struct.pack mistake fails
+         loudly at startup instead of silently corrupting wire data.
+      3. Tick catch-up loop advances exactly N ticks for a wall-clock
+         delta of N*tick_interval (no off-by-one, no missed ticks under
+         jitter). We model the loop arithmetic directly here.
+    """
+    # 1. Wrap parity. SCREEN bounds in fixed-point (FIXED_SCALE = 65536).
+    lo = SCREEN_MIN_X
+    hi = SCREEN_MAX_X
+    lo_f = lo * FIXED_SCALE
+    hi_f = hi * FIXED_SCALE
+    # Overshoot past hi → snap to lo (same as Saturn).
+    assert _wrap_coord_saturn(hi_f + 12345, lo, hi) == lo_f, "wrap_saturn hi"
+    assert _wrap_coord_saturn(lo_f - 12345, lo, hi) == hi_f, "wrap_saturn lo"
+    # In-bounds → unchanged.
+    assert _wrap_coord_saturn(0, lo, hi) == 0, "wrap_saturn in-bounds"
+
+    # 2. Round-trip build_asteroid_sync. Manually unpack what we built.
+    sample = [(0, 100, 200, 300, 400),
+              (5, -1, -2, -3, -4),
+              (49, FIXED_SCALE * 100, FIXED_SCALE * -50, 1000, -2000)]
+    frame = build_asteroid_sync(sample)
+    # Frame layout: [LEN_HI][LEN_LO][TYPE=0xB2][count]{17 bytes}xN
+    payload_len = (frame[0] << 8) | frame[1]
+    assert payload_len == 2 + 17 * len(sample), \
+        "build_asteroid_sync length wrong: %d" % payload_len
+    assert frame[2] == DNET_MSG_ASTEROID_SYNC, "wrong msg type"
+    assert frame[3] == len(sample), "wrong count"
+    off = 4
+    for i, (slot, x, y, dx, dy) in enumerate(sample):
+        s_slot = frame[off]
+        s_x, s_y, s_dx, s_dy = struct.unpack("!iiii", frame[off + 1:off + 17])
+        assert s_slot == (slot & 0xFF), "entry %d slot" % i
+        assert s_x == x and s_y == y and s_dx == dx and s_dy == dy, \
+            "entry %d field mismatch" % i
+        off += 17
+
+    # 3. Tick catch-up arithmetic. Given a wall-clock interval and a tick
+    # interval, the loop should run floor(elapsed / tick_interval) ticks.
+    interval = 0.05  # 20 Hz
+    cap = 10
+    for elapsed_ticks in [1, 3, 9, 10, 11, 25, 100]:
+        elapsed = interval * elapsed_ticks
+        last_tick = 0.0
+        now = elapsed
+        ran = 0
+        while now - last_tick >= interval and ran < cap:
+            last_tick += interval
+            ran += 1
+        # Below the cap → ran exactly elapsed_ticks; at/above cap → ran=cap.
+        expected = min(elapsed_ticks, cap)
+        assert ran == expected, \
+            "catchup %s: ran=%d expected=%d" % (elapsed_ticks, ran, expected)
 # =========================================================================
 
 
@@ -489,7 +576,11 @@ def _circle_collision(x1: int, y1: int, r1: int,
 
 
 def _wrap_coord(val: int, lo: int, hi: int) -> int:
-    """Wrap a jo_fixed coordinate within screen bounds."""
+    """Modulo-style wrap for jo_fixed coordinates within screen bounds.
+
+    Preserves overshoot when crossing the edge. Used by the LERP-mode tick
+    path to keep behavior byte-for-byte identical to v1.0.0/v1.1.0 LERP.
+    """
     lo_f = lo * FIXED_SCALE
     hi_f = hi * FIXED_SCALE
     span = hi_f - lo_f
@@ -497,6 +588,24 @@ def _wrap_coord(val: int, lo: int, hi: int) -> int:
         val -= span
     elif val < lo_f:
         val += span
+    return val
+
+
+def _wrap_coord_saturn(val: int, lo: int, hi: int) -> int:
+    """Edge-snap wrap matching the Saturn client's `boundGameplayObject`
+    in objects/objects.c. When a coord crosses an edge, it's clamped to
+    the OPPOSITE edge — overshoot is discarded.
+
+    This matches what the Saturn renders, so server-side asteroid /
+    player positions stay aligned with the client's view across many
+    wrap events. Used by the RING-mode tick path.
+    """
+    lo_f = lo * FIXED_SCALE
+    hi_f = hi * FIXED_SCALE
+    if val < lo_f:
+        return hi_f
+    if val > hi_f:
+        return lo_f
     return val
 
 
@@ -673,14 +782,20 @@ class GameSimulation:
             "size": size, "type": atype, "alive": True,
         }
 
-    def tick(self) -> list:
+    def tick(self, wrap_saturn: bool = False) -> list:
         """Run one server tick (~50ms). Returns list of events to broadcast.
 
         Runs TICK_RATIO sub-steps per tick (one per Saturn frame) so that
         collision detection effectively operates at 60Hz, preventing fast
         objects from tunneling through each other.
+
+        `wrap_saturn`: when True (RING + asteroid_sync_correct), use
+        `_wrap_coord_saturn` (edge-snap, matches Saturn) for both player
+        and asteroid wrap. When False (LERP path), use legacy `_wrap_coord`
+        (modulo-style, byte-for-byte v1.0.0/v1.1.0 LERP behavior).
         """
         events = []
+        wrap_fn = _wrap_coord_saturn if wrap_saturn else _wrap_coord
 
         if self.game_over:
             return events
@@ -712,8 +827,8 @@ class GameSimulation:
                     continue
                 p["x"] += p["dx"]
                 p["y"] += p["dy"]
-                p["x"] = _wrap_coord(p["x"], SCREEN_MIN_X, SCREEN_MAX_X)
-                p["y"] = _wrap_coord(p["y"], SCREEN_MIN_Y, SCREEN_MAX_Y)
+                p["x"] = wrap_fn(p["x"], SCREEN_MIN_X, SCREEN_MAX_X)
+                p["y"] = wrap_fn(p["y"], SCREEN_MIN_Y, SCREEN_MAX_Y)
 
             # Advance asteroid positions by 1 frame
             for i, a in enumerate(self.asteroids):
@@ -721,8 +836,8 @@ class GameSimulation:
                     continue
                 a["x"] += a["dx"]
                 a["y"] += a["dy"]
-                a["x"] = _wrap_coord(a["x"], SCREEN_MIN_X, SCREEN_MAX_X)
-                a["y"] = _wrap_coord(a["y"], SCREEN_MIN_Y, SCREEN_MAX_Y)
+                a["x"] = wrap_fn(a["x"], SCREEN_MIN_X, SCREEN_MAX_X)
+                a["y"] = wrap_fn(a["y"], SCREEN_MIN_Y, SCREEN_MAX_Y)
 
             # Check ship-asteroid collisions at this sub-step
             for pid, p in self.players.items():
@@ -1170,6 +1285,12 @@ class DisasteroidsServer:
             "ship_sync_keepalive_ticks": 60,   # force relay every N server ticks
             "bot_sync_every_n_ticks": 1,       # 1=20Hz, 2=10Hz, 3≈7Hz, 4=5Hz
             "sync_mode": "LERP",               # LERP | RING (toggle for Utenyaa-style sync)
+            # v1.1.1 — asteroid drift correction. Only takes effect when
+            # sync_mode==RING. Server enables: (a) wall-clock catch-up loop
+            # in the tick scheduler, (b) Saturn-matching edge-snap wrap, and
+            # (c) periodic ASTEROID_SYNC broadcasts. When False, server runs
+            # the v1.1.0 LERP-style asteroid path even if sync_mode==RING.
+            "asteroid_sync_correct": True,
         }
         self._tuning_presets = {
             "PASSTHROUGH": {
@@ -1371,11 +1492,45 @@ class DisasteroidsServer:
                 elif sock in self.clients:
                     self._handle_client_data(sock)
 
-            # Game simulation tick
+            # Game simulation tick.
+            #
+            # Two scheduler paths gated by the v1.1.1 asteroid-correction
+            # toggle:
+            #
+            #   LERP / asteroid_sync_correct OFF — single-shot scheduler
+            #     (byte-for-byte identical to v1.0.0 / v1.1.0 LERP). If the
+            #     server was busy and missed a tick window, that tick is
+            #     silently dropped — server's asteroid simulation falls
+            #     behind the Saturn's deterministic local sim, which is
+            #     the documented v1.1.0 LERP behavior.
+            #
+            #   RING + asteroid_sync_correct ON — bounded catch-up loop:
+            #     run every missed tick (up to 10) so the server's
+            #     wall-clock asteroid simulation stays aligned with the
+            #     Saturn's per-frame advance. Cap prevents a multi-second
+            #     pause (debugger / GC / swap) from triggering a huge
+            #     burst when execution resumes.
             if self.game_active and self.sim and not self.game_paused:
-                if now - self._last_tick >= self._tick_interval:
-                    self._last_tick = now
-                    self._game_tick()
+                use_catchup = (
+                    self.tuning.get("sync_mode", "LERP") == "RING" and
+                    self.tuning.get("asteroid_sync_correct", True))
+                if use_catchup:
+                    catchup_cap = 10
+                    ran = 0
+                    while (now - self._last_tick >= self._tick_interval
+                           and ran < catchup_cap):
+                        self._game_tick()
+                        self._last_tick += self._tick_interval
+                        ran += 1
+                    # If we hit the cap, fast-forward last_tick so we don't
+                    # keep bursting on every iteration of the main loop.
+                    if (ran >= catchup_cap and
+                            now - self._last_tick >= self._tick_interval):
+                        self._last_tick = now
+                else:
+                    if now - self._last_tick >= self._tick_interval:
+                        self._last_tick = now
+                        self._game_tick()
 
             # Periodic tasks
             self._check_timeouts(now)
@@ -2116,12 +2271,26 @@ class DisasteroidsServer:
         # downgrade hysteresis can expire without relying on an event.
         if self._auto_mode and (self._tick_counter % 20) == 0:
             self._evaluate_auto_preset()
-        events = self.sim.tick()
+        # Pass the wrap mode to the simulation so it picks the
+        # Saturn-matching edge-snap when asteroid correction is on.
+        wrap_saturn = (
+            self.tuning.get("sync_mode", "LERP") == "RING" and
+            self.tuning.get("asteroid_sync_correct", True))
+        events = self.sim.tick(wrap_saturn=wrap_saturn)
         for evt in events:
             if evt[0] == "wave_over":
                 self._start_new_wave()
             else:
                 self._broadcast_event(evt)
+
+        # Periodic asteroid drift correction (1.5s @ 20Hz). Belt-and-
+        # suspenders: with the catch-up loop and Saturn-matching wrap,
+        # client and server asteroid sims should already agree to within
+        # a pixel. ASTEROID_SYNC catches anything that slips through —
+        # the client snaps if drift < 3 px, lerps 75% otherwise.
+        if (wrap_saturn and self._tick_counter > 0 and
+                (self._tick_counter % 30) == 0):
+            self._broadcast_asteroid_sync()
 
         # End game when no humans remain alive (bots don't keep game going)
         if self.game_active and self.sim and not self.sim.game_over:
@@ -2291,6 +2460,25 @@ class DisasteroidsServer:
         """Send a message to all in-game clients."""
         for s, c in self.clients.items():
             if c.in_game:
+                c.send_raw(msg)
+
+    def _broadcast_asteroid_sync(self):
+        """Build + send ASTEROID_SYNC for active asteroids to ring-capable
+        clients. Old clients (no CLIENT_CAPS announcement) skip via the
+        in_game / supports_ring filter so they never see this message at
+        all — they remain on the v1.0.0/v1.1.0 deterministic-only path."""
+        if not self.sim:
+            return
+        entries = []
+        for slot, a in enumerate(self.sim.asteroids):
+            if a is None or not a.get("alive"):
+                continue
+            entries.append((slot, a["x"], a["y"], a["dx"], a["dy"]))
+        if not entries:
+            return
+        msg = build_asteroid_sync(entries)
+        for s, c in self.clients.items():
+            if c.in_game and c.supports_ring:
                 c.send_raw(msg)
 
     # ------------------------------------------------------------------
@@ -2510,12 +2698,13 @@ class DisasteroidsServer:
         if not isinstance(data, dict):
             return
         preset = data.get("preset")
-        # sync_mode is orthogonal to bandwidth preset — it never forces
-        # the preset to CUSTOM. Pull it out separately so the rest of the
-        # logic only sees true bandwidth knobs.
+        # sync_mode and asteroid_sync_correct are orthogonal axes — they
+        # never force the bandwidth preset to CUSTOM. Pull them aside so
+        # the rest of the logic only sees true bandwidth knobs.
         sync_mode_change = data.get("sync_mode")
-        bandwidth_keys = [k for k in data.keys()
-                          if k != "preset" and k != "sync_mode"]
+        asteroid_correct_change = data.get("asteroid_sync_correct")
+        ORTHOGONAL = {"preset", "sync_mode", "asteroid_sync_correct"}
+        bandwidth_keys = [k for k in data.keys() if k not in ORTHOGONAL]
 
         if preset == "AUTO":
             # Enable AUTO and snap to the target preset immediately; hysteresis
@@ -2527,10 +2716,17 @@ class DisasteroidsServer:
             self._apply_tuning_preset(target, from_auto=True)
             log.info("Tuning: AUTO mode enabled, snapped to %s (n=%d)",
                      target, n)
-            # sync_mode passed alongside AUTO still applies independently.
+            # sync_mode and asteroid_sync_correct passed alongside AUTO
+            # still apply independently.
             if sync_mode_change is not None:
                 self.tuning["sync_mode"] = sync_mode_change
                 log.info("Tuning: sync_mode=%s", sync_mode_change)
+                self._broadcast_sync_mode()
+            if asteroid_correct_change is not None:
+                self.tuning["asteroid_sync_correct"] = \
+                    bool(asteroid_correct_change)
+                log.info("Tuning: asteroid_sync_correct=%s",
+                         asteroid_correct_change)
             return
 
         if preset and preset != "CUSTOM":
@@ -2554,6 +2750,14 @@ class DisasteroidsServer:
             # Notify all connected clients. Old/non-ring-capable clients
             # are silently kept on LERP regardless of the global setting.
             self._broadcast_sync_mode()
+
+        if asteroid_correct_change is not None:
+            # Pure server-side knob — does NOT force CUSTOM preset and
+            # does NOT broadcast a wire message. Takes effect on the
+            # next tick when the gate is re-evaluated.
+            self.tuning["asteroid_sync_correct"] = bool(asteroid_correct_change)
+            log.info("Tuning: asteroid_sync_correct=%s",
+                     asteroid_correct_change)
 
     def _apply_tuning_preset(self, preset_name: str,
                              from_auto: bool = False) -> bool:
@@ -2748,7 +2952,7 @@ _TUNING_INT_RANGES = {
     "ship_sync_keepalive_ticks": (15, 120),
     "bot_sync_every_n_ticks":    (1, 4),
 }
-_TUNING_BOOL_KEYS = {"ship_sync_skip_stationary"}
+_TUNING_BOOL_KEYS = {"ship_sync_skip_stationary", "asteroid_sync_correct"}
 _TUNING_STR_ENUMS = {
     "sync_mode": ("LERP", "RING"),
 }
@@ -2945,6 +3149,16 @@ def main():
         log.error("Quantization self-test FAILED: %s", e)
         sys.exit(1)
     log.info("Quantization self-test passed (q_pos / q_vel / q_angle)")
+
+    # v1.1.1 — validate asteroid drift correction subsystem on startup
+    # (Saturn-matching wrap, build_asteroid_sync round-trip, catch-up
+    # loop arithmetic). Same fail-loud pattern as the quant test above.
+    try:
+        _asteroid_sync_selftest()
+    except AssertionError as e:
+        log.error("Asteroid sync self-test FAILED: %s", e)
+        sys.exit(1)
+    log.info("Asteroid sync self-test passed (wrap / build / catch-up)")
 
     server = DisasteroidsServer(host=args.host, port=args.port,
                                 num_bots=args.bots,

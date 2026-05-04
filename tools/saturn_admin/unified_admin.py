@@ -257,6 +257,13 @@ def _render_admin_html() -> bytes:
       <label><input type="radio" name="syncmode-{slug}" value="LERP"> LERP <span class="muted">(default, current)</span></label>
       <label><input type="radio" name="syncmode-{slug}" value="RING"> RING <span class="muted">(Utenyaa-style)</span></label>
     </div>
+    <div class="tuning-knobs" style="margin-top:8px">
+      <label>
+        <input type="checkbox" data-key="asteroid_sync_correct" class="sync-asteroid-correct">
+        Asteroid drift correction
+        <span class="muted">(only effective in RING mode — server tick catch-up + Saturn-matching wrap + periodic ASTEROID_SYNC)</span>
+      </label>
+    </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn" onclick="applySyncMode('{slug}')">Apply</button>
       <button class="btn btn-warn" onclick="applySyncModeDirect('{slug}','LERP')">Revert to LERP</button>
@@ -651,11 +658,19 @@ function wireSyncInputs(slug){
   sp.__wired=true;
   $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){
     r.addEventListener('change',function(){syncDirty[slug]=true;
-      // Visual hint matching the bandwidth panel pattern.
       var b=$('.sync-badge',sp);
       if(b)b.textContent=(b.textContent.replace(/ \\(pending.*$/,''))+' (pending — click Apply)';
     });
   });
+  // Asteroid drift correction sub-toggle. Marks the panel dirty exactly
+  // like the radios so the next refresh tick won't stomp the user's edit.
+  var ac=$('.sync-asteroid-correct',sp);
+  if(ac){
+    ac.addEventListener('change',function(){syncDirty[slug]=true;
+      var b=$('.sync-badge',sp);
+      if(b)b.textContent=(b.textContent.replace(/ \\(pending.*$/,''))+' (pending — click Apply)';
+    });
+  }
 }
 function renderSyncMode(slug,d){
   var sp=$('.sync-panel',panel(slug));
@@ -666,6 +681,15 @@ function renderSyncMode(slug,d){
     $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){
       r.checked=(r.value===mode);
     });
+    var ac=$('.sync-asteroid-correct',sp);
+    if(ac){
+      // Default to true (server default) when the field is missing, so a
+      // fresh server doesn't show the box unchecked just because of a
+      // /api/tuning round-trip.
+      var v=d.tuning.asteroid_sync_correct;
+      ac.checked = (v===undefined) ? true : !!v;
+      ac.disabled = (mode!=='RING');
+    }
   }
   var badge=$('.sync-badge',sp);
   if(badge){
@@ -679,9 +703,12 @@ function applySyncMode(slug){
   var mode=null;
   $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){if(r.checked)mode=r.value;});
   if(!mode){showMsg('Pick a sync mode first','#d32f2f');return;}
-  api('POST',slug,'tuning',{sync_mode:mode}).then(function(r){
+  var body={sync_mode:mode};
+  var ac=$('.sync-asteroid-correct',sp);
+  if(ac) body.asteroid_sync_correct = !!ac.checked;
+  api('POST',slug,'tuning',body).then(function(r){
     if(r.error){showMsg('Sync error: '+r.error,'#d32f2f');return;}
-    showMsg('Sync mode set to '+mode);
+    showMsg('Sync settings applied ('+mode+(ac?(', asteroid_correct='+(ac.checked?'on':'off')):'')+')');
     syncDirty[slug]=false;
     refreshTuning(slug);
   }).catch(function(e){showMsg('Sync apply failed: '+e.message,'#d32f2f');});

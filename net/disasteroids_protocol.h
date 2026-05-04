@@ -94,6 +94,13 @@
  */
 #define DNET_MSG_SET_SYNC_MODE     0xB0  /* [mode:1] (0=LERP, 1=RING) */
 #define DNET_MSG_SHIP_SYNC_Q       0xB1  /* quantized SHIP_SYNC (see above) */
+#define DNET_MSG_ASTEROID_SYNC     0xB2  /* periodic asteroid pos correction
+                                           [count:1]{slot:1,x:4,y:4,dx:4,dy:4}xN
+                                           Sent only to ring-capable clients
+                                           when sync_mode==RING and the
+                                           tuning.asteroid_sync_correct knob
+                                           is on. Old clients ignore via
+                                           default-case dispatcher. */
 
 /* Sync mode constants (match server-side string mapping in dserver.py). */
 #define DNET_SYNC_MODE_LERP        0
