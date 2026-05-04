@@ -29,16 +29,24 @@
 #define DNET_INPUT_BUFFER_PER_PLAYER 8  /* Frames of input to buffer per player */
 #define DNET_LEADERBOARD_MAX   10    /* Max leaderboard entries */
 
-/* Snapshot ring (RING mode only). Per-pid history of received server poses,
- * indexed by server_frame. Size 20 covers ~2.6 sec at 7.5 Hz update rate
- * — enough headroom to bracket interp targets even under modem hiccups.
+/* Snapshot ring (RING mode only). Per-pid history of received server poses.
+ * Size 20 covers ~2.6 sec at 7.5 Hz update rate — enough headroom to
+ * bracket interp targets even under modem hiccups.
  *
- * DNET_INTERP_LAG_FRAMES is how far behind the latest snapshot we render,
- * tuned for 30 fps NTSC: 3 frames ≈ 100 ms (matches Utenyaa's wall-clock
- * window of 100 ms @ 50 fps PAL = 5 frames). Smaller = more responsive but
- * more visible extrapolation; larger = smoother but laggier. */
+ * v1.1.2: snapshot keying changed from server-tick units (20 Hz) to
+ * Saturn-frame units (60 Hz). The target (now - lag) advances by 1 each
+ * Saturn frame so the bracket-pair interp produces a continuous curve
+ * across the ~8-frame gap between SHIP_SYNC_Q arrivals. Pre-1.1.2 the
+ * target was constant within a snapshot window, causing stair-step
+ * jitter at the 7.5 Hz update rate.
+ *
+ * DNET_INTERP_LAG_FRAMES is the render delay in Saturn frames. 9 frames
+ * ≈ 150 ms — slightly more than Utenyaa's 100 ms-wallclock window
+ * because Disasteroids' server stamps snapshots at 7.5 Hz, half
+ * Utenyaa's 20 Hz, so we need a bigger buffer to keep the `newer`
+ * snapshot in hand most of the time. */
 #define DNET_SNAP_RING_SIZE        20
-#define DNET_INTERP_LAG_FRAMES      3
+#define DNET_INTERP_LAG_FRAMES      9
 
 /*============================================================================
  * Network State Machine

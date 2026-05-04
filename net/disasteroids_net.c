@@ -525,7 +525,12 @@ static void process_ship_sync_quant(const uint8_t* payload, int len)
     ring = &g_net.snap_rings[pid];
     slot = ring->head % DNET_SNAP_RING_SIZE;
     e = &ring->entries[slot];
-    e->frame = server_frame;
+    /* v1.1.2: key snapshots by Saturn's local 60 Hz frame counter, not by
+     * the server's 20 Hz tick stamp. This lets `target = frame_count -
+     * lag` advance every Saturn frame so bracket-pair interp produces a
+     * continuous curve. The server frame is still preserved separately
+     * in g_net.last_recv_server_frame for hit-report lag-comp.            */
+    e->frame = (uint16_t)g_net.frame_count;
     e->x  = dnet_d_pos(x_q);
     e->y  = dnet_d_pos(y_q);
     e->dx = dnet_d_vel(dx_q);
@@ -650,9 +655,13 @@ void dnet_apply_remote_snapshots(void)
     if (g_net.sync_mode != DNET_SYNC_MODE_RING) return;
     if (g_net.state != DNET_STATE_PLAYING) return;
 
-    /* Render at "now - INTERP_LAG" so we almost always have a `newer`
-     * snapshot in hand and the cheap interp path runs. */
-    target = (uint16_t)(g_net.last_recv_server_frame - DNET_INTERP_LAG_FRAMES);
+    /* Render at "now - INTERP_LAG" using Saturn's local 60 Hz frame
+     * counter so the target advances by 1 every frame. With snapshots
+     * keyed in the same units, the bracket-pair interp produces a
+     * smooth curve between server samples (v1.1.2 fix — earlier code
+     * used the server's 20 Hz tick which made target constant for
+     * ~8 Saturn frames at a time, causing stair-step jitter). */
+    target = (uint16_t)(g_net.frame_count - DNET_INTERP_LAG_FRAMES);
 
     for (pid = 0; pid < DNET_MAX_PLAYERS; pid++) {
         PPLAYER player;
