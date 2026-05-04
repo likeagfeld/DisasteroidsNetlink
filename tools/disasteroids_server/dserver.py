@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import base64
+import collections
 import json
 import logging
 import math
@@ -34,7 +35,7 @@ import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +86,7 @@ DNET_MSG_REMOVE_BOT = 0x18
 DNET_MSG_REMOVE_LOCAL_PLAYER = 0x19
 DNET_MSG_SHIP_ASTEROID_HIT = 0x1A
 DNET_MSG_LEADERBOARD_REQ = 0x1B
+DNET_MSG_CLIENT_CAPS = 0x1C  # [caps:1] bit0=supports_ring
 
 # Disasteroids Messages — Server -> Client
 DNET_MSG_LOBBY_STATE = 0xA0
@@ -104,6 +106,26 @@ DNET_MSG_PLAYER_KILL = 0xAD
 DNET_MSG_PLAYER_SPAWN = 0xAE
 DNET_MSG_LOCAL_PLAYER_ACK = 0x86
 DNET_MSG_LEADERBOARD_DATA = 0xAF
+DNET_MSG_SET_SYNC_MODE = 0xB0  # [mode:1] (0=LERP, 1=RING)
+DNET_MSG_SHIP_SYNC_Q = 0xB1    # quantized SHIP_SYNC (12-byte payload)
+
+# Sync-mode wire constants. MUST match Saturn-side DNET_SYNC_MODE_* in
+# disasteroids_protocol.h. Stored as strings in self.tuning for human-friendly
+# admin API; converted to byte for the wire by _sync_mode_to_byte() below.
+SYNC_MODE_BYTE = {"LERP": 0, "RING": 1}
+
+# Capability flag bits sent in CLIENT_CAPS payload.
+CAP_SUPPORTS_RING = 0x01
+
+# Quantization shift amounts. MUST match Saturn-side DNET_QPOS_SHIFT etc.
+QPOS_SHIFT = 9       # 1/128 unit precision, ±256 unit range
+QVEL_SHIFT = 10      # 1/64 unit/frame precision, ±2 unit/frame range
+QANGLE_SHIFT = 8     # 256 levels = 1.4° precision
+
+# Snapshot-ring depth on the server side (Phase 4 lag-comp). 30 entries
+# at the per-player SHIP_STATE rate (~7.5 Hz) gives ~4 sec of history —
+# more than enough to rewind any in-flight projectile.
+SERVER_SNAP_RING_DEPTH = 30
 
 # Game types (matching Disasteroids GAME_TYPE enum)
 GAME_TYPE_COOP = 0
@@ -277,6 +299,118 @@ def build_ship_sync_raw(player_id: int, raw_payload: bytes) -> bytes:
     return encode_frame(payload)
 
 
+# === Phase 3: quantized SHIP_SYNC + sync-mode helpers ====================
+# Shift-only quantizers (no divide). Saturn-side decoders are pure left
+# shifts of these results — see DNET_QPOS_SHIFT/DNET_QVEL_SHIFT/DNET_QANGLE_SHIFT
+# in disasteroids_protocol.h. Round-trip parity is required; tested in the
+# `_q_parity_selftest()` function called from main().
+
+
+def _q_clamp(v: int, lo: int, hi: int) -> int:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def q_pos(fxp: int) -> int:
+    """Quantize fxp position to int16 (>>9 → 1/128 unit precision)."""
+    # Arithmetic shift right (Python ints are unbounded so `>>` does what
+    # we want on signed values). Clamp to the int16 wire range to defend
+    # against rare out-of-bounds positions before they corrupt the packet.
+    return _q_clamp(fxp >> QPOS_SHIFT, -32768, 32767)
+
+
+def q_vel(fxp: int) -> int:
+    """Quantize fxp velocity to int8 (>>10 → 1/64 unit/frame precision)."""
+    return _q_clamp(fxp >> QVEL_SHIFT, -128, 127)
+
+
+def q_angle(rot: int) -> int:
+    """Quantize SGL int16 angle to uint8 (>>8 → 1.4° precision).
+    The angle wraps modulo 65536, so we mask first to a uint16 range,
+    then shift. Result is in [0, 255]."""
+    return (rot & 0xFFFF) >> QANGLE_SHIFT
+
+
+def build_ship_sync_quant(player_id: int, server_frame: int,
+                          x: int, y: int, dx: int, dy: int,
+                          rot: int, flags: int) -> bytes:
+    """Quantized SHIP_SYNC for RING-capable clients. 12-byte payload total.
+
+    Wire: [type:1][pid:1][server_frame:2 BE][x_q:i16 BE][y_q:i16 BE]
+          [dx_q:i8][dy_q:i8][angle_q:u8][flags:1]
+    """
+    payload = bytes([DNET_MSG_SHIP_SYNC_Q, player_id & 0xFF])
+    payload += struct.pack("!H", server_frame & 0xFFFF)
+    payload += struct.pack("!hh", q_pos(x), q_pos(y))
+    payload += struct.pack("!bb", q_vel(dx), q_vel(dy))
+    payload += struct.pack("!BB", q_angle(rot), flags & 0xFF)
+    return encode_frame(payload)
+
+
+def build_set_sync_mode(mode_str: str) -> bytes:
+    """Tell a client which sync engine to run. mode_str is 'LERP' or 'RING'."""
+    payload = bytes([DNET_MSG_SET_SYNC_MODE, SYNC_MODE_BYTE.get(mode_str, 0)])
+    return encode_frame(payload)
+
+
+def _q_parity_selftest():
+    """Round-trip a representative set of values through quantize→dequantize
+    and verify error is within the documented precision. Run at startup so
+    a botched edit to the q_* helpers fails loudly instead of silently
+    corrupting wire data."""
+    # Mirror the Saturn-side decoders.
+    def d_pos(q: int) -> int:
+        # Saturn does ((int32_t)q) << 9. For Python signed ints that is
+        # the same as q * 512 since q is already signed.
+        return q * (1 << QPOS_SHIFT)
+
+    def d_vel(q: int) -> int:
+        return q * (1 << QVEL_SHIFT)
+
+    def d_angle(q: int) -> int:
+        # Saturn does ((uint16_t)q) << 8 then casts to int16.
+        v = (q & 0xFF) << QANGLE_SHIFT
+        if v >= 0x8000:
+            v -= 0x10000
+        return v
+
+    # Position: ±256 world units in fxp 16.16. q_pos has 1/128 unit precision.
+    pos_max_err = 0
+    for fxp in (0, 65536, -65536, 32768, -32768,  # 1, -1, 0.5, -0.5 units
+                256 * 65536 - 1, -256 * 65536):
+        err = abs(fxp - d_pos(q_pos(fxp)))
+        pos_max_err = max(pos_max_err, err)
+    assert pos_max_err < 512, "q_pos parity failed: max err %d > 512" % pos_max_err
+
+    # Velocity: ±2 units/frame. q_vel has 1/64 unit/frame precision.
+    vel_max_err = 0
+    for fxp in (0, 1024, -1024, 32768, -32768,  # tiny, half-unit, full-unit
+                127 * 1024, -128 * 1024):
+        err = abs(fxp - d_vel(q_vel(fxp)))
+        vel_max_err = max(vel_max_err, err)
+    assert vel_max_err < 1024, "q_vel parity failed: max err %d > 1024" % vel_max_err
+
+    # Angle: 256 levels around the 65536-unit circle. ~256-unit max error.
+    ang_max_err = 0
+    for rot in (0, 16384, -16384, 32767, -32768, 65535, 1):
+        decoded = d_angle(q_angle(rot))
+        # Both decoded and rot represent angles modulo 65536; compute the
+        # circular distance as the smaller of |a-b| and 65536-|a-b|.
+        diff = abs(((rot - decoded) & 0xFFFF))
+        if diff > 32768:
+            diff = 65536 - diff
+        ang_max_err = max(ang_max_err, diff)
+    assert ang_max_err < 256, "q_angle parity failed: max err %d >= 256" % ang_max_err
+
+
+def _sync_mode_byte(mode_str: str) -> int:
+    return SYNC_MODE_BYTE.get(mode_str, 0)
+# =========================================================================
+
+
 def build_asteroid_destroy(slot: int, scorer_id: int,
                            children: list) -> bytes:
     """children: list of (child_slot, dx, dy, size, type) tuples."""
@@ -392,11 +526,18 @@ class GameSimulation:
             "invuln_frames": INVULNERABILITY_TIMER,
             "lives": self.num_lives,
             "respawn_frames": 0,
+            # Phase 4 lag-comp: ring of recent (frame, x, y, dx, dy) so
+            # PvP hit reports carrying a firer_frame can be compared
+            # against the victim's authoritative pose at that moment.
+            "history": collections.deque(maxlen=SERVER_SNAP_RING_DEPTH),
         }
 
     def update_player_pos(self, player_id: int, x: int, y: int,
-                          dx: int, dy: int, flags: int):
-        """Update player position and velocity from SHIP_STATE."""
+                          dx: int, dy: int, flags: int,
+                          server_frame: int = 0):
+        """Update player position and velocity from SHIP_STATE.
+        `server_frame` is appended to the history ring; default 0 keeps
+        legacy callers working without behavior change."""
         if player_id not in self.players:
             return
         p = self.players[player_id]
@@ -407,6 +548,33 @@ class GameSimulation:
         p["alive"] = bool(flags & 0x01)
         if flags & 0x02:
             p["invuln_frames"] = max(p["invuln_frames"], 1)
+        # Push to history (Phase 4). Used by lookup_player_at() during
+        # PvP hit lag-compensation.
+        p["history"].append((server_frame & 0xFFFF, x, y, dx, dy))
+
+    def lookup_player_at(self, player_id: int, frame: int):
+        """Return the player's pose closest to `frame` from history, or
+        None if the ring is empty. Searches for an exact frame match
+        first (typical case — frames arrive in order); falls back to
+        the closest neighbor by signed delta. Returns (x, y, dx, dy)."""
+        p = self.players.get(player_id)
+        if not p or not p["history"]:
+            return None
+        target = frame & 0xFFFF
+        best = None
+        best_delta = 0xFFFF
+        for entry in p["history"]:
+            ef, ex, ey, edx, edy = entry
+            # Signed 16-bit distance handles wrap.
+            d = (target - ef) & 0xFFFF
+            if d > 0x8000:
+                d = 0x10000 - d
+            if best is None or d < best_delta:
+                best = (ex, ey, edx, edy)
+                best_delta = d
+                if d == 0:
+                    break
+        return best
 
     def start_wave(self) -> tuple:
         """Generate a new wave of asteroids.
@@ -909,6 +1077,13 @@ class ClientInfo:
         # Tuning bookkeeping (SHIP_SYNC relay throttle)
         self.ship_sync_relay_counter = 0
         self.last_ship_sync_relay_tick = 0
+        # Phase 3: capability handshake. Old clients (pre-1.1.0) never
+        # send CLIENT_CAPS, so we default to "no advanced caps" — they
+        # always receive raw 22-byte SHIP_SYNC and ignore SET_SYNC_MODE.
+        self.supports_ring = False
+        # Last sync mode this client was told about. None = never told.
+        # Lets us avoid spamming SET_SYNC_MODE on every tick.
+        self.last_sent_sync_mode = None
         # Egress telemetry (rolling window)
         self._egress_bytes = 0
         self._egress_window_start = time.time()
@@ -982,6 +1157,11 @@ class DisasteroidsServer:
 
         # --- Runtime-tunable bandwidth knobs (see admin /api/tuning) ---
         # All defaults match pre-tuning behavior exactly (PASSTHROUGH).
+        # `sync_mode` is orthogonal to the bandwidth presets: LERP keeps
+        # current single-snapshot lerp+extrap behavior, RING activates the
+        # snapshot-ring + interp/extrap engine on clients that support it
+        # (Phase 3 client opt-in via SET_SYNC_MODE message). Defaulting
+        # to LERP preserves byte-for-byte backward compatibility.
         self.tuning = {
             "preset": "PASSTHROUGH",
             "ship_sync_decimate": 1,           # relay every Nth SHIP_STATE per source
@@ -989,6 +1169,7 @@ class DisasteroidsServer:
             "stationary_vel_threshold": 2,     # |dx|+|dy| below this = stationary
             "ship_sync_keepalive_ticks": 60,   # force relay every N server ticks
             "bot_sync_every_n_ticks": 1,       # 1=20Hz, 2=10Hz, 3≈7Hz, 4=5Hz
+            "sync_mode": "LERP",               # LERP | RING (toggle for Utenyaa-style sync)
         }
         self._tuning_presets = {
             "PASSTHROUGH": {
@@ -1020,6 +1201,9 @@ class DisasteroidsServer:
                 "bot_sync_every_n_ticks": 3,
             },
         }
+        # sync_mode is independent of the bandwidth presets — switching
+        # bandwidth preset does NOT touch sync_mode. Keep it as its own
+        # axis so admins can mix-and-match (e.g., AGGRESSIVE + RING).
         # AUTO mode tracking
         self._auto_mode = False          # when True, preset is re-selected on count change
         self._auto_last_downgrade = 0.0  # timestamp of last candidate-downgrade (for hysteresis)
@@ -1351,6 +1535,8 @@ class DisasteroidsServer:
             self._handle_remove_local_player(sock, client)
         elif msg_type == DNET_MSG_LEADERBOARD_REQ:
             self._send_leaderboard_to_client(client)
+        elif msg_type == DNET_MSG_CLIENT_CAPS:
+            self._handle_client_caps(sock, client, payload)
         else:
             log.debug("Unknown message type 0x%02X from %s",
                       msg_type, client.address)
@@ -1713,6 +1899,40 @@ class DisasteroidsServer:
             if c.authenticated and c.in_game:
                 c.send_raw(pause_msg)
 
+    def _handle_client_caps(self, sock, client: ClientInfo, payload: bytes):
+        """Client announced its capabilities. Updates per-client state and
+        immediately tells the client the current global sync mode so its
+        sync engine and ours agree before any SHIP_SYNC traffic flows."""
+        if len(payload) < 2:
+            return
+        caps = payload[1]
+        client.supports_ring = bool(caps & CAP_SUPPORTS_RING)
+        log.info("Client %s caps: 0x%02X (ring=%s)",
+                 client.username or "?", caps, client.supports_ring)
+        # Tell the client which engine to run. Always send so the client
+        # knows even if the global default has changed since it connected.
+        self._send_sync_mode_to(client, force=True)
+
+    def _send_sync_mode_to(self, client: ClientInfo, force: bool = False):
+        """Send DNET_MSG_SET_SYNC_MODE to one client if needed. RING mode is
+        only honored on clients that announced ring support; everyone else
+        gets LERP unconditionally (so old clients never see anything but
+        the raw 22-byte SHIP_SYNC they were built to parse)."""
+        global_mode = self.tuning.get("sync_mode", "LERP")
+        effective = global_mode if client.supports_ring else "LERP"
+        if not force and client.last_sent_sync_mode == effective:
+            return
+        client.send_raw(build_set_sync_mode(effective))
+        client.last_sent_sync_mode = effective
+
+    def _broadcast_sync_mode(self):
+        """Send SET_SYNC_MODE to all connected, authenticated clients.
+        Called when the admin flips the toggle. No-op for clients whose
+        last_sent_sync_mode already matches the effective value."""
+        for s, c in self.clients.items():
+            if c.authenticated:
+                self._send_sync_mode_to(c)
+
     def _handle_ship_state(self, sock, client: ClientInfo, payload: bytes):
         if not self.game_active or not client.in_game:
             return
@@ -1744,7 +1964,8 @@ class DisasteroidsServer:
             raw_data = payload[1:]
 
         if self.sim:
-            self.sim.update_player_pos(player_id, x, y, dx, dy, flags)
+            self.sim.update_player_pos(player_id, x, y, dx, dy, flags,
+                                        server_frame=self._tick_counter)
 
         # Apply tuning gates (decimate + skip_stationary w/ keepalive).
         # Defaults (PASSTHROUGH) make this block a no-op.
@@ -1763,10 +1984,34 @@ class DisasteroidsServer:
                 should_relay = False
 
         if should_relay:
-            sync_msg = build_ship_sync_raw(player_id, raw_data)
+            # Two recipient classes:
+            #   - LERP recipients (old clients OR global mode == LERP): get
+            #     the raw 22-byte SHIP_SYNC byte-for-byte identical to the
+            #     pre-1.1.0 server. Pure relay of the firer's bytes.
+            #   - RING recipients (ring-capable + global mode == RING): get
+            #     the 14-byte quantized SHIP_SYNC_Q stamped with the
+            #     server's current tick as `server_frame`.
+            global_mode = self.tuning.get("sync_mode", "LERP")
+            raw_msg = build_ship_sync_raw(player_id, raw_data)
+            quant_msg = None
+            # rot is at offset 18..19 of the 20-byte raw_data when the
+            # client sent the 21-byte (extended) form; the helper's
+            # `raw_data` slice always starts at the x field.
+            try:
+                rot_val = struct.unpack("!h", raw_data[16:18])[0]
+            except struct.error:
+                rot_val = 0
             for s, c in self.clients.items():
-                if c.in_game and s != sock:
-                    c.send_raw(sync_msg)
+                if not c.in_game or s == sock:
+                    continue
+                if global_mode == "RING" and c.supports_ring:
+                    if quant_msg is None:
+                        quant_msg = build_ship_sync_quant(
+                            player_id, self._tick_counter,
+                            x, y, dx, dy, rot_val, flags)
+                    c.send_raw(quant_msg)
+                else:
+                    c.send_raw(raw_msg)
             client.last_ship_sync_relay_tick = self._tick_counter
 
     def _handle_asteroid_hit(self, sock, client: ClientInfo, payload: bytes):
@@ -1797,6 +2042,32 @@ class DisasteroidsServer:
 
         slot = payload[1]
         player_id = payload[2]
+
+        # Phase 4 hit-message v2: optional [firer_frame:2 BE] tail. Old
+        # clients send 3-byte payload (no frame); new clients send 5-byte.
+        # Server simply ignores the extra bytes if absent.
+        firer_frame = None
+        if len(payload) >= 5:
+            firer_frame = (payload[3] << 8) | payload[4]
+            # Lag-comp lookup: where was the victim at firer_frame?
+            # Logged at debug level for diagnostic purposes; we do not
+            # currently REJECT hits based on this (cheating isn't a
+            # concern, and rejecting would be a behavior change at risk
+            # of breaking legit hits during modem stalls). Once the
+            # diagnostic data validates the model in real sessions, we
+            # can promote this to authoritative validation.
+            if slot == 0xFF and player_id in self.sim.players:
+                hist = self.sim.lookup_player_at(player_id, firer_frame)
+                if hist:
+                    cur = self.sim.players[player_id]
+                    drift_x = abs(cur["x"] - hist[0])
+                    drift_y = abs(cur["y"] - hist[1])
+                    log.debug(
+                        "PvP hit lag-comp: pid=%d firer_frame=%d "
+                        "now=(%d,%d) then=(%d,%d) drift=(%d,%d)",
+                        player_id, firer_frame,
+                        cur["x"], cur["y"], hist[0], hist[1],
+                        drift_x, drift_y)
 
         # For ship-asteroid collision, validate target belongs to sender.
         # For PvP kill (slot=0xFF), any valid in-game player is acceptable.
@@ -1887,7 +2158,8 @@ class DisasteroidsServer:
             if self.sim:
                 self.sim.update_player_pos(bot.game_player_id,
                                            bot.x, bot.y,
-                                           bot.dx, bot.dy, flags)
+                                           bot.dx, bot.dy, flags,
+                                           server_frame=self._tick_counter)
 
             # Delta compression for bot input relay
             bot.force_send_counter += 1
@@ -1903,10 +2175,26 @@ class DisasteroidsServer:
             bot.sync_tick_counter += 1
             bot_sync_every_n = max(1, int(self.tuning["bot_sync_every_n_ticks"]))
             if (bot.sync_tick_counter % bot_sync_every_n) == 0:
-                sync_msg = build_ship_sync(
+                # Same per-recipient dispatch as human SHIP_SYNC relay:
+                # RING-capable clients on the global RING engine get the
+                # quantized form; everyone else gets the raw 22-byte form.
+                global_mode = self.tuning.get("sync_mode", "LERP")
+                raw_sync = build_ship_sync(
                     bot.game_player_id, bot.x, bot.y,
                     bot.dx, bot.dy, bot.rot & 0x7FFF, flags)
-                self._broadcast_to_game(sync_msg)
+                quant_sync = None
+                for s, c in self.clients.items():
+                    if not c.in_game:
+                        continue
+                    if global_mode == "RING" and c.supports_ring:
+                        if quant_sync is None:
+                            quant_sync = build_ship_sync_quant(
+                                bot.game_player_id, self._tick_counter,
+                                bot.x, bot.y, bot.dx, bot.dy,
+                                bot.rot & 0x7FFF, flags)
+                        c.send_raw(quant_sync)
+                    else:
+                        c.send_raw(raw_sync)
 
     def _start_new_wave(self):
         """Start a new wave: generate asteroids + player spawns."""
@@ -2162,12 +2450,50 @@ class DisasteroidsServer:
         except Exception as e:
             log.warning("Failed to save join history: %s", e)
 
-    def _log_join(self, name: str, ip: str, event: str):
+    def _log_join(self, name: str, ip: str, event: str, reason: str = ""):
+        # New entries carry both human-readable `time` (kept for legacy
+        # /api/history consumers) and epoch `t` (used by /api/join_history
+        # so the unified admin can render relative timestamps). `reason`
+        # is optional and defaults to empty for backward compatibility.
         self._join_history.append({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "t": int(time.time()),
             "name": name, "ip": ip, "event": event,
+            "reason": reason,
         })
         self._save_join_history()
+
+    def _join_history_events(self, limit: int = 200):
+        """Return the last `limit` join entries normalized to the shape
+        used by the unified admin portal: {events:[{t,ts,event,name,ip,reason}]}.
+        Backward-compatible with legacy entries that lack `t` or `reason`."""
+        # Cap limit to a reasonable upper bound to avoid pathological queries.
+        if limit < 1:
+            limit = 1
+        if limit > 1000:
+            limit = 1000
+        out = []
+        for entry in self._join_history[-limit:]:
+            ts_str = entry.get("time", "")
+            t_epoch = entry.get("t")
+            # Best-effort epoch from legacy `time` strings if `t` missing.
+            if t_epoch is None and ts_str:
+                try:
+                    t_epoch = int(time.mktime(
+                        time.strptime(ts_str, "%Y-%m-%d %H:%M:%S")))
+                except (ValueError, OverflowError):
+                    t_epoch = 0
+            out.append({
+                "t": int(t_epoch or 0),
+                "ts": ts_str,
+                "event": entry.get("event", ""),
+                "name": entry.get("name", ""),
+                "ip": entry.get("ip", ""),
+                "reason": entry.get("reason", ""),
+            })
+        # Newest first for display.
+        out.reverse()
+        return out
 
     # ------------------------------------------------------------------
     # Tuning helpers
@@ -2184,7 +2510,12 @@ class DisasteroidsServer:
         if not isinstance(data, dict):
             return
         preset = data.get("preset")
-        individual_keys = [k for k in data.keys() if k != "preset"]
+        # sync_mode is orthogonal to bandwidth preset — it never forces
+        # the preset to CUSTOM. Pull it out separately so the rest of the
+        # logic only sees true bandwidth knobs.
+        sync_mode_change = data.get("sync_mode")
+        bandwidth_keys = [k for k in data.keys()
+                          if k != "preset" and k != "sync_mode"]
 
         if preset == "AUTO":
             # Enable AUTO and snap to the target preset immediately; hysteresis
@@ -2196,21 +2527,33 @@ class DisasteroidsServer:
             self._apply_tuning_preset(target, from_auto=True)
             log.info("Tuning: AUTO mode enabled, snapped to %s (n=%d)",
                      target, n)
+            # sync_mode passed alongside AUTO still applies independently.
+            if sync_mode_change is not None:
+                self.tuning["sync_mode"] = sync_mode_change
+                log.info("Tuning: sync_mode=%s", sync_mode_change)
             return
 
         if preset and preset != "CUSTOM":
             # Named preset bundle — apply and disable AUTO.
             self._apply_tuning_preset(preset, from_auto=False)
 
-        if individual_keys:
-            # Individual knob overrides — disable AUTO, mark as CUSTOM.
-            for key in individual_keys:
+        if bandwidth_keys:
+            # Individual bandwidth-knob overrides — disable AUTO, mark as CUSTOM.
+            for key in bandwidth_keys:
                 self.tuning[key] = data[key]
             self.tuning["preset"] = "CUSTOM"
             self._auto_mode = False
             self._auto_current = "CUSTOM"
             log.info("Tuning: CUSTOM (knobs: %s)",
-                     ", ".join("%s=%s" % (k, data[k]) for k in individual_keys))
+                     ", ".join("%s=%s" % (k, data[k]) for k in bandwidth_keys))
+
+        if sync_mode_change is not None:
+            # sync_mode is independent — does NOT force CUSTOM preset.
+            self.tuning["sync_mode"] = sync_mode_change
+            log.info("Tuning: sync_mode=%s", sync_mode_change)
+            # Notify all connected clients. Old/non-ring-capable clients
+            # are silently kept on LERP regardless of the global setting.
+            self._broadcast_sync_mode()
 
     def _apply_tuning_preset(self, preset_name: str,
                              from_auto: bool = False) -> bool:
@@ -2406,6 +2749,9 @@ _TUNING_INT_RANGES = {
     "bot_sync_every_n_ticks":    (1, 4),
 }
 _TUNING_BOOL_KEYS = {"ship_sync_skip_stationary"}
+_TUNING_STR_ENUMS = {
+    "sync_mode": ("LERP", "RING"),
+}
 
 
 def _validate_tuning_update(data, presets):
@@ -2429,6 +2775,10 @@ def _validate_tuning_update(data, presets):
         elif key in _TUNING_BOOL_KEYS:
             if not isinstance(val, bool):
                 return False, "%s must be bool" % key
+        elif key in _TUNING_STR_ENUMS:
+            allowed = _TUNING_STR_ENUMS[key]
+            if not isinstance(val, str) or val not in allowed:
+                return False, "%s must be one of %s" % (key, list(allowed))
         else:
             return False, "unknown key: %s" % key
     return True, ""
@@ -2499,6 +2849,16 @@ def _make_disast_admin_handler(server_ref):
                 entries = list(self.srv._join_history[-200:])
                 entries.reverse()
                 self._send_json({"entries": entries})
+            elif path == "/api/join_history":
+                # Mirror of MMM/Utenyaa shape so the unified admin can render
+                # this tab the same way. Supports ?limit=N (default 200, capped 1000).
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    limit = int(qs.get("limit", ["200"])[0])
+                except (ValueError, TypeError):
+                    limit = 200
+                self._send_json(
+                    {"events": self.srv._join_history_events(limit)})
             elif path == "/api/tuning":
                 srv = self.srv
                 presets = list(srv._tuning_presets.keys()) + ["AUTO", "CUSTOM"]
@@ -2576,6 +2936,15 @@ def main():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Validate quantization round-trip on startup. A botched q_*/d_*
+    # edit fails here loudly instead of silently mangling SHIP_SYNC_Q.
+    try:
+        _q_parity_selftest()
+    except AssertionError as e:
+        log.error("Quantization self-test FAILED: %s", e)
+        sys.exit(1)
+    log.info("Quantization self-test passed (q_pos / q_vel / q_angle)")
 
     server = DisasteroidsServer(host=args.host, port=args.port,
                                 num_bots=args.bots,

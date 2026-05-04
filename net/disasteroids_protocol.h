@@ -53,6 +53,7 @@
 #define DNET_MSG_REMOVE_LOCAL_PLAYER 0x19 /* (no payload) - remove second local player */
 #define DNET_MSG_SHIP_ASTEROID_HIT 0x1A  /* [slot:1][player_id:1] local player hit asteroid */
 #define DNET_MSG_LEADERBOARD_REQ   0x1B  /* Client requests leaderboard (no payload) */
+#define DNET_MSG_CLIENT_CAPS       0x1C  /* [caps_flags:1] bit0=supports_ring (sent after lobby entry) */
 
 /*============================================================================
  * Disasteroids Server -> Client Messages (0xA0 - 0xBF)
@@ -75,6 +76,36 @@
 #define DNET_MSG_PLAYER_SPAWN      0xAE  /* [player_id:1][angle:2][invuln:2] */
 #define DNET_MSG_LOCAL_PLAYER_ACK  0x86  /* [player_id:1] */
 #define DNET_MSG_LEADERBOARD_DATA 0xAF  /* [count:1]{name_len:1,name:N,wins:2BE,best:2BE,gp:2BE}... */
+
+/* Sync engine messages (server→client). Sent only to clients that announced
+ * support via DNET_MSG_CLIENT_CAPS. Kept above 0xAF so older clients
+ * (before the sync engine upgrade) silently ignore them via default-case.
+ *
+ * SHIP_SYNC_Q wire layout (12-byte payload, 14 total with SNCP header):
+ *   [type:1=0xB1][pid:1][server_frame:2 BE]
+ *   [x_q:i16 BE][y_q:i16 BE]
+ *   [dx_q:i8][dy_q:i8]
+ *   [angle_q:u8][flags:1]
+ *
+ * Quantization constants (matched on server side via _q_pos / _q_vel / _q_angle):
+ *   q_pos   = fxp >> 9    (1/128 unit precision, ±256 unit range)
+ *   q_vel   = fxp >> 10   (1/64  unit/frame precision, ±2 unit/frame range)
+ *   q_angle = u16 angle >> 8  (256 levels = 1.4° precision)
+ */
+#define DNET_MSG_SET_SYNC_MODE     0xB0  /* [mode:1] (0=LERP, 1=RING) */
+#define DNET_MSG_SHIP_SYNC_Q       0xB1  /* quantized SHIP_SYNC (see above) */
+
+/* Sync mode constants (match server-side string mapping in dserver.py). */
+#define DNET_SYNC_MODE_LERP        0
+#define DNET_SYNC_MODE_RING        1
+
+/* Client capability flag bits (sent in DNET_MSG_CLIENT_CAPS). */
+#define DNET_CAP_SUPPORTS_RING     0x01
+
+/* Quantization shift amounts. MUST match server-side q_pos/q_vel/q_angle. */
+#define DNET_QPOS_SHIFT            9
+#define DNET_QVEL_SHIFT            10
+#define DNET_QANGLE_SHIFT          8
 
 /*============================================================================
  * Input State Bitmask (matches Jo Engine key definitions)
@@ -428,6 +459,46 @@ static inline int dnet_encode_leaderboard_req(uint8_t* buf)
     buf[1] = 0x01;
     buf[2] = DNET_MSG_LEADERBOARD_REQ;
     return 3;
+}
+
+/**
+ * Encode CLIENT_CAPS: announce the client's optional capabilities to the
+ * server. Sent once on entering the lobby. Old clients never send this;
+ * new clients send caps_flags = DNET_CAP_SUPPORTS_RING (0x01).
+ */
+static inline int dnet_encode_client_caps(uint8_t* buf, uint8_t caps_flags)
+{
+    buf[0] = 0x00;
+    buf[1] = 0x02;  /* payload = type(1) + caps(1) */
+    buf[2] = DNET_MSG_CLIENT_CAPS;
+    buf[3] = caps_flags;
+    return 4;
+}
+
+/**
+ * Encode SHIP_ASTEROID_HIT v2: same opcode, payload extended with a
+ * firer_frame field (the most recent server frame the firer received).
+ * Server uses this for lag-compensated PvP hit validation.
+ *
+ * Wire layout: [type:1][slot:1][player_id:1][firer_frame:2 BE] = 5 bytes payload, 7 total.
+ *
+ * Backward compat: the server detects v2 by payload length (>= 5 bytes
+ * including type). Older clients still send the 3-byte form via
+ * dnet_encode_ship_asteroid_hit() above; servers handle both shapes.
+ */
+static inline int dnet_encode_ship_asteroid_hit_v2(uint8_t* buf,
+                                                    uint8_t slot,
+                                                    uint8_t player_id,
+                                                    uint16_t firer_frame)
+{
+    buf[0] = 0x00;
+    buf[1] = 5;   /* payload = type(1) + slot(1) + pid(1) + frame(2) */
+    buf[2] = DNET_MSG_SHIP_ASTEROID_HIT;
+    buf[3] = slot;
+    buf[4] = player_id;
+    buf[5] = (uint8_t)((firer_frame >> 8) & 0xFF);
+    buf[6] = (uint8_t)(firer_frame & 0xFF);
+    return 7;
 }
 
 /**

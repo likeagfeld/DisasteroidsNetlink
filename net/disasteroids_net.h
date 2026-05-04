@@ -29,6 +29,17 @@
 #define DNET_INPUT_BUFFER_PER_PLAYER 8  /* Frames of input to buffer per player */
 #define DNET_LEADERBOARD_MAX   10    /* Max leaderboard entries */
 
+/* Snapshot ring (RING mode only). Per-pid history of received server poses,
+ * indexed by server_frame. Size 20 covers ~2.6 sec at 7.5 Hz update rate
+ * — enough headroom to bracket interp targets even under modem hiccups.
+ *
+ * DNET_INTERP_LAG_FRAMES is how far behind the latest snapshot we render,
+ * tuned for 30 fps NTSC: 3 frames ≈ 100 ms (matches Utenyaa's wall-clock
+ * window of 100 ms @ 50 fps PAL = 5 frames). Smaller = more responsive but
+ * more visible extrapolation; larger = smoother but laggier. */
+#define DNET_SNAP_RING_SIZE        20
+#define DNET_INTERP_LAG_FRAMES      3
+
 /*============================================================================
  * Network State Machine
  *============================================================================*/
@@ -74,6 +85,31 @@ typedef struct {
     uint16_t best_score;
     uint16_t games_played;
 } dnet_leaderboard_entry_t;
+
+/*============================================================================
+ * Snapshot Ring Entry (RING sync mode)
+ *
+ * Single received server pose for a remote player, used by the
+ * bracketing-pair interpolator. `frame` is the server's monotonic tick
+ * counter at the moment the pose was sampled. Velocity is carried
+ * alongside position so cheap extrapolation can run when no `newer`
+ * snapshot has arrived yet.
+ *============================================================================*/
+
+typedef struct {
+    uint16_t frame;     /* server frame_num when this snapshot was sent */
+    int32_t  x, y;      /* position fxp 16.16 (decoded from quantized form) */
+    int32_t  dx, dy;    /* velocity fxp 16.16 (decoded from quantized form) */
+    int16_t  rot;       /* SGL angle */
+    uint8_t  flags;     /* bit0=alive, bit1=invuln, bit2=thrust */
+    uint8_t  valid;
+} dnet_snap_entry_t;
+
+typedef struct {
+    dnet_snap_entry_t entries[DNET_SNAP_RING_SIZE];
+    int      head;      /* next write position */
+    int      count;     /* total entries written (saturating at SIZE) */
+} dnet_snap_ring_t;
 
 /*============================================================================
  * Remote Input Buffer
@@ -173,6 +209,22 @@ typedef struct {
     /* Online leaderboard (from server) */
     dnet_leaderboard_entry_t leaderboard[DNET_LEADERBOARD_MAX];
     int leaderboard_count;
+
+    /* === Sync engine state (Phase 3) === */
+    /* DNET_SYNC_MODE_LERP (0) = current single-snapshot lerp+extrap path;
+     * DNET_SYNC_MODE_RING (1) = snapshot-ring interp/extrap path. Set by
+     * server via DNET_MSG_SET_SYNC_MODE. Defaults to LERP — old servers
+     * that never send the message keep us on the known-good path. */
+    uint8_t  sync_mode;
+    /* Most recently observed server frame number (from SHIP_SYNC_Q). Sent
+     * back as `firer_frame` in PvP hit reports so the server can rewind
+     * the victim to the moment we believed we landed the shot. */
+    uint16_t last_recv_server_frame;
+    /* True after we have sent CLIENT_CAPS at least once this connection. */
+    bool     caps_sent;
+    /* Per-pid snapshot rings. Indexed by player_id; my_player_id slot
+     * is unused (we never render ourselves from a snapshot). */
+    dnet_snap_ring_t snap_rings[DNET_MAX_PLAYERS];
 
 } dnet_state_data_t;
 
@@ -277,5 +329,28 @@ void dnet_clear_log(void);
 
 /** Request leaderboard data from server. */
 void dnet_request_leaderboard(void);
+
+/**
+ * Apply remote-player snapshots to the live PLAYER state.
+ *
+ * In RING sync mode, this walks each remote player's snapshot ring,
+ * computes the bracketing-pair-interpolated pose at frame
+ * (last_recv_server_frame - DNET_INTERP_LAG_FRAMES), and writes the
+ * result to g_Players[pid].curPos.
+ *
+ * In LERP mode this is a no-op — the existing process_ship_sync handler
+ * has already snapped curPos at receive time, and the per-frame remote
+ * coast is handled inside applyInputBitsToPlayer (gameplay.c).
+ *
+ * Call once per gameplay frame in online mode, AFTER input handling
+ * and BEFORE rendering.
+ */
+void dnet_apply_remote_snapshots(void);
+
+/** Get the most recently received server frame number (for hit reports). */
+uint16_t dnet_get_last_server_frame(void);
+
+/** Get current sync mode (DNET_SYNC_MODE_LERP or DNET_SYNC_MODE_RING). */
+uint8_t dnet_get_sync_mode(void);
 
 #endif /* DISASTEROIDS_NET_H */

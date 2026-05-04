@@ -133,6 +133,13 @@ void dnet_on_connected(void)
  * Message Processing
  *============================================================================*/
 
+/* Forward declarations for sync-engine helpers. Definitions live further
+ * down the file alongside the rest of the RING-mode machinery; declaring
+ * them here lets process_welcome call them without GCC inferring an
+ * implicit (non-static) declaration that would later conflict. */
+static void dnet_clear_snap_ring(uint8_t pid);
+static void dnet_clear_all_snap_rings(void);
+
 static void process_welcome(const uint8_t* payload, int len)
 {
     int off;
@@ -162,6 +169,20 @@ static void process_welcome(const uint8_t* payload, int len)
     g_net.state = DNET_STATE_LOBBY;
     g_net.status_msg = "In Lobby";
     dnet_log("Welcome! You are Player");
+
+    /* Reset sync engine state for the fresh session and announce capabilities
+     * to the server. Default to LERP — server will SET_SYNC_MODE if the
+     * global toggle is RING. Old servers that never send the message keep
+     * us on LERP, which is byte-for-byte the previous client behavior. */
+    g_net.sync_mode = DNET_SYNC_MODE_LERP;
+    g_net.last_recv_server_frame = 0;
+    dnet_clear_all_snap_rings();
+    if (!g_net.caps_sent) {
+        int slen = dnet_encode_client_caps(g_net.tx_buf,
+                                            DNET_CAP_SUPPORTS_RING);
+        net_transport_send(g_net.transport, g_net.tx_buf, slen);
+        g_net.caps_sent = true;
+    }
 
     /* If we have a second local player, register them now */
     if (g_Game.hasSecondLocal && g_Game.playerName2[0] != '\0') {
@@ -263,6 +284,10 @@ static void process_game_start(const uint8_t* payload, int len)
     /* Clear lobby roster — server will resend via PLAYER_JOIN with game IDs */
     memset(g_net.lobby_players, 0, sizeof(g_net.lobby_players));
     g_net.lobby_count = 0;
+
+    /* Snapshot rings carry no useful pre-match data; clear so the first
+     * SHIP_SYNC_Q in the new match becomes the seed entry. */
+    dnet_clear_all_snap_rings();
 
     /* Clear game roster — PLAYER_JOIN messages will populate it */
     memset(g_net.game_roster, 0, sizeof(g_net.game_roster));
@@ -414,6 +439,262 @@ static void process_ship_sync(const uint8_t* payload, int len)
         player->curPos.x += player->curPos.dx * 3;
         player->curPos.y += player->curPos.dy * 3;
     }
+}
+
+/*============================================================================
+ * Sync engine — RING mode (Phase 3)
+ *
+ * Snapshot-ring + bracketing-pair interpolation + velocity extrapolation.
+ * Activated when the server sends SET_SYNC_MODE with mode=RING. While
+ * active, server sends quantized SHIP_SYNC_Q (12-byte payload) instead of
+ * raw 20-byte SHIP_SYNC. We push received poses into per-pid rings; each
+ * frame, dnet_apply_remote_snapshots() walks the ring and writes the
+ * interpolated pose to player->curPos.
+ *
+ * Quantization decoders are pure shifts (no divide). They MUST match
+ * the server-side q_pos / q_vel / q_angle arithmetic exactly — see
+ * disasteroids_protocol.h DNET_QPOS_SHIFT/DNET_QVEL_SHIFT/DNET_QANGLE_SHIFT.
+ *============================================================================*/
+
+static inline int32_t dnet_d_pos(int16_t q)
+{
+    return ((int32_t)q) << DNET_QPOS_SHIFT;
+}
+
+static inline int32_t dnet_d_vel(int8_t q)
+{
+    return ((int32_t)q) << DNET_QVEL_SHIFT;
+}
+
+static inline int16_t dnet_d_angle(uint8_t q)
+{
+    /* Sign-extending the result so wrap-aware lerp arithmetic works. */
+    return (int16_t)(((uint16_t)q) << DNET_QANGLE_SHIFT);
+}
+
+static void dnet_clear_snap_ring(uint8_t pid)
+{
+    if (pid >= DNET_MAX_PLAYERS) return;
+    memset(&g_net.snap_rings[pid], 0, sizeof(g_net.snap_rings[pid]));
+}
+
+static void dnet_clear_all_snap_rings(void)
+{
+    int i;
+    for (i = 0; i < DNET_MAX_PLAYERS; i++)
+        dnet_clear_snap_ring((uint8_t)i);
+}
+
+/* Process SHIP_SYNC_Q: quantized server pose snapshot for a remote player.
+ * Pushes the decoded pose into the per-pid ring; rendering happens later
+ * inside dnet_apply_remote_snapshots(). */
+static void process_ship_sync_quant(const uint8_t* payload, int len)
+{
+    uint8_t pid;
+    uint16_t server_frame;
+    int16_t x_q, y_q;
+    int8_t  dx_q, dy_q;
+    uint8_t angle_q, flags;
+    dnet_snap_ring_t* ring;
+    dnet_snap_entry_t* e;
+    int slot;
+
+    /* [type:1][pid:1][server_frame:2][x_q:2][y_q:2][dx_q:1][dy_q:1][angle_q:1][flags:1] = 12 */
+    if (len < 12) return;
+
+    pid = payload[1];
+    if (pid >= DNET_MAX_PLAYERS) return;
+    if (pid == g_net.my_player_id) return;
+    if (g_Game.hasSecondLocal && pid == g_Game.myPlayerID2) return;
+
+    server_frame = ((uint16_t)payload[2] << 8) | (uint16_t)payload[3];
+    x_q   = (int16_t)(((uint16_t)payload[4] << 8) | (uint16_t)payload[5]);
+    y_q   = (int16_t)(((uint16_t)payload[6] << 8) | (uint16_t)payload[7]);
+    dx_q  = (int8_t)payload[8];
+    dy_q  = (int8_t)payload[9];
+    angle_q = payload[10];
+    flags = payload[11];
+
+    /* Track latest server frame for hit-report lag-comp. Use signed delta
+     * comparison so 16-bit wrap is handled correctly. */
+    {
+        int16_t delta = (int16_t)(server_frame - g_net.last_recv_server_frame);
+        if (delta > 0) g_net.last_recv_server_frame = server_frame;
+    }
+
+    ring = &g_net.snap_rings[pid];
+    slot = ring->head % DNET_SNAP_RING_SIZE;
+    e = &ring->entries[slot];
+    e->frame = server_frame;
+    e->x  = dnet_d_pos(x_q);
+    e->y  = dnet_d_pos(y_q);
+    e->dx = dnet_d_vel(dx_q);
+    e->dy = dnet_d_vel(dy_q);
+    e->rot = dnet_d_angle(angle_q);
+    e->flags = flags;
+    e->valid = 1;
+
+    ring->head++;
+    if (ring->count < DNET_SNAP_RING_SIZE) ring->count++;
+}
+
+/* Server toggled the global sync mode. Clear rings on EITHER transition
+ * so brief residue from the old mode doesn't pollute the new mode. */
+static void process_set_sync_mode(const uint8_t* payload, int len)
+{
+    uint8_t new_mode;
+    if (len < 2) return;
+    new_mode = payload[1] ? DNET_SYNC_MODE_RING : DNET_SYNC_MODE_LERP;
+    if (new_mode == g_net.sync_mode) return;
+    g_net.sync_mode = new_mode;
+    dnet_clear_all_snap_rings();
+    if (new_mode == DNET_SYNC_MODE_RING)
+        dnet_log("Sync: RING engine on");
+    else
+        dnet_log("Sync: LERP engine on");
+}
+
+/* Bracketing-pair interp + velocity extrap, matching Utenyaa's algorithm
+ * but tuned for 30 fps NTSC (3-frame interp lag). Returns 1 on success
+ * with out_* filled, 0 if the ring has no usable snapshot.
+ *
+ * Wrap-aware position lerp: when the lerp delta exceeds half the screen,
+ * we lerp the short way around the wrap. Same trick as the existing
+ * LERP path in process_ship_sync(). */
+static int fetch_interp_pose(uint8_t pid, uint16_t target_frame,
+                             int32_t* out_x, int32_t* out_y,
+                             int32_t* out_dx, int32_t* out_dy,
+                             int16_t* out_rot, uint8_t* out_flags)
+{
+    dnet_snap_ring_t* ring;
+    const dnet_snap_entry_t *older = (void*)0;
+    const dnet_snap_entry_t *newer = (void*)0;
+    int i, idx;
+
+    if (pid >= DNET_MAX_PLAYERS) return 0;
+    ring = &g_net.snap_rings[pid];
+    if (ring->count == 0) return 0;
+
+    /* Walk backwards from head (newest first) to find bracket. */
+    for (i = 0; i < ring->count && i < DNET_SNAP_RING_SIZE; i++) {
+        const dnet_snap_entry_t* e;
+        int16_t delta;
+        idx = (ring->head - 1 - i + DNET_SNAP_RING_SIZE) % DNET_SNAP_RING_SIZE;
+        e = &ring->entries[idx];
+        if (!e->valid) continue;
+        delta = (int16_t)(e->frame - target_frame);
+        if (delta <= 0) {
+            if (!older || (int16_t)(e->frame - older->frame) > 0) older = e;
+        } else {
+            if (!newer || (int16_t)(newer->frame - e->frame) > 0) newer = e;
+        }
+    }
+
+    if (older && newer) {
+        /* Standard interp between bracketing snapshots. */
+        int span = (int)(int16_t)(newer->frame - older->frame);
+        int t_n  = (int)(int16_t)(target_frame - older->frame);
+        int32_t t_fxp;
+        int32_t dx_pos, dy_pos;
+        int32_t rot_delta;
+
+        if (span <= 0) span = 1;
+        if (t_n < 0)   t_n = 0;
+        if (t_n > span) t_n = span;
+        t_fxp = (int32_t)(((int64_t)t_n << 16) / (int64_t)span);
+
+        dx_pos = newer->x - older->x;
+        dy_pos = newer->y - older->y;
+        /* Wrap-aware: pick the short way around. */
+        if (dx_pos > SCREEN_MAX_X)       dx_pos -= (SCREEN_MAX_X - SCREEN_MIN_X);
+        else if (dx_pos < SCREEN_MIN_X)  dx_pos += (SCREEN_MAX_X - SCREEN_MIN_X);
+        if (dy_pos > SCREEN_MAX_Y)       dy_pos -= (SCREEN_MAX_Y - SCREEN_MIN_Y);
+        else if (dy_pos < SCREEN_MIN_Y)  dy_pos += (SCREEN_MAX_Y - SCREEN_MIN_Y);
+
+        *out_x = older->x + (int32_t)(((int64_t)dx_pos * t_fxp) >> 16);
+        *out_y = older->y + (int32_t)(((int64_t)dy_pos * t_fxp) >> 16);
+        /* Velocity is the bracket's interpolated rate — useful to renderers
+         * and to the local physics that may want it. Linear lerp is fine. */
+        *out_dx = older->dx + (int32_t)(((int64_t)(newer->dx - older->dx) * t_fxp) >> 16);
+        *out_dy = older->dy + (int32_t)(((int64_t)(newer->dy - older->dy) * t_fxp) >> 16);
+        /* Angle lerp on signed delta so it wraps correctly across 0. */
+        rot_delta = (int32_t)(int16_t)(newer->rot - older->rot);
+        *out_rot = (int16_t)(older->rot + (int16_t)((rot_delta * t_fxp) >> 16));
+        *out_flags = (t_fxp >= (1 << 15)) ? newer->flags : older->flags;
+        return 1;
+    }
+
+    if (older) {
+        /* Pure extrapolation: target is past the latest snapshot. */
+        int dt = (int)(int16_t)(target_frame - older->frame);
+        if (dt < 0) dt = 0;
+        if (dt > 6) dt = 6;  /* cap extrap to 6 frames so a stalled stream doesn't fly off-screen */
+        *out_x = older->x + older->dx * dt;
+        *out_y = older->y + older->dy * dt;
+        *out_dx = older->dx;
+        *out_dy = older->dy;
+        *out_rot = older->rot;
+        *out_flags = older->flags;
+        return 1;
+    }
+
+    /* Only future snapshots — caller leaves remote at last known pose. */
+    return 0;
+}
+
+void dnet_apply_remote_snapshots(void)
+{
+    uint8_t pid;
+    uint16_t target;
+
+    if (g_net.sync_mode != DNET_SYNC_MODE_RING) return;
+    if (g_net.state != DNET_STATE_PLAYING) return;
+
+    /* Render at "now - INTERP_LAG" so we almost always have a `newer`
+     * snapshot in hand and the cheap interp path runs. */
+    target = (uint16_t)(g_net.last_recv_server_frame - DNET_INTERP_LAG_FRAMES);
+
+    for (pid = 0; pid < DNET_MAX_PLAYERS; pid++) {
+        PPLAYER player;
+        int32_t nx, ny, ndx, ndy;
+        int16_t nrot;
+        uint8_t nflags;
+
+        if (pid == g_net.my_player_id) continue;
+        if (g_Game.hasSecondLocal && pid == g_Game.myPlayerID2) continue;
+        if (g_net.snap_rings[pid].count == 0) continue;
+
+        if (pid >= MAX_PLAYERS) continue;
+        player = &g_Players[pid];
+        if (player->objectState != OBJECT_STATE_ACTIVE) continue;
+
+        if (!fetch_interp_pose(pid, target, &nx, &ny, &ndx, &ndy,
+                               &nrot, &nflags))
+            continue;
+
+        /* Wrap into world bounds so we don't end up drawing off-screen. */
+        if (nx >= SCREEN_MAX_X) nx -= (SCREEN_MAX_X - SCREEN_MIN_X);
+        else if (nx < SCREEN_MIN_X) nx += (SCREEN_MAX_X - SCREEN_MIN_X);
+        if (ny >= SCREEN_MAX_Y) ny -= (SCREEN_MAX_Y - SCREEN_MIN_Y);
+        else if (ny < SCREEN_MIN_Y) ny += (SCREEN_MAX_Y - SCREEN_MIN_Y);
+
+        player->curPos.x = (jo_fixed)nx;
+        player->curPos.y = (jo_fixed)ny;
+        player->curPos.dx = (jo_fixed)ndx;
+        player->curPos.dy = (jo_fixed)ndy;
+        player->curPos.rot = (jo_fixed)nrot;
+        player->isThrusting = (nflags & 0x04) ? true : false;
+    }
+}
+
+uint16_t dnet_get_last_server_frame(void)
+{
+    return g_net.last_recv_server_frame;
+}
+
+uint8_t dnet_get_sync_mode(void)
+{
+    return g_net.sync_mode;
 }
 
 static void process_asteroid_spawn(const uint8_t* payload, int len)
@@ -717,10 +998,19 @@ static void process_message(const uint8_t* payload, int len)
 
     case DNET_MSG_PLAYER_LEAVE:
         dnet_log("Player left!");
+        if (len >= 2) dnet_clear_snap_ring(payload[1]);
         break;
 
     case DNET_MSG_SHIP_SYNC:
         process_ship_sync(payload, len);
+        break;
+
+    case DNET_MSG_SHIP_SYNC_Q:
+        process_ship_sync_quant(payload, len);
+        break;
+
+    case DNET_MSG_SET_SYNC_MODE:
+        process_set_sync_mode(payload, len);
         break;
 
     case DNET_MSG_ASTEROID_SPAWN:
@@ -930,7 +1220,11 @@ void dnet_send_ship_asteroid_hit(uint8_t slot, uint8_t player_id)
     int len;
     if (g_net.state != DNET_STATE_PLAYING || !g_net.transport) return;
 
-    len = dnet_encode_ship_asteroid_hit(g_net.tx_buf, slot, player_id);
+    /* Always send v2 (with firer_frame). Older servers ignore the extra
+     * 2 bytes (their handler reads payload[1..2] only); new servers use
+     * the frame stamp for lag-compensated PvP hit validation. */
+    len = dnet_encode_ship_asteroid_hit_v2(g_net.tx_buf, slot, player_id,
+                                            g_net.last_recv_server_frame);
     net_transport_send(g_net.transport, g_net.tx_buf, len);
 }
 

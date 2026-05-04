@@ -377,9 +377,34 @@ static void checkForPlayerProjectilesCollision(PPLAYER player)
 
         {
             int shipRadius = PLAYER_SHIP_RADIUS;
+            int sx, sy;
             if(g_Game.isOnlineMode) shipRadius += 3; /* compensate for network position desync */
-            result = checkForCircleCollision(toINT(player->curPos.x), toINT(player->curPos.y), shipRadius,
+            sx = toINT(player->curPos.x);
+            sy = toINT(player->curPos.y);
+            result = checkForCircleCollision(sx, sy, shipRadius,
                                              toINT(projectile->curPos.x), toINT(projectile->curPos.y), PROJECTILE_RADIUS);
+
+            /* Sub-stepped sweep (online mode): when projectiles travel more
+             * than the ship's radius per frame, a single point-test can let
+             * the bullet "tunnel" through a remote ship — visible as bullets
+             * passing through ships. Re-test at the previous frame's
+             * position and the midpoint so any of the three discrete samples
+             * catches the overlap. Cost: 2 extra circle tests per (proj,
+             * ship) pair only when no hit was found at the end position. */
+            if (result == 0 && g_Game.isOnlineMode)
+            {
+                int mx = toINT(projectile->curPos.x - (projectile->curPos.dx >> 1));
+                int my = toINT(projectile->curPos.y - (projectile->curPos.dy >> 1));
+                result = checkForCircleCollision(sx, sy, shipRadius,
+                                                 mx, my, PROJECTILE_RADIUS);
+                if (result == 0)
+                {
+                    int px = toINT(projectile->curPos.x - projectile->curPos.dx);
+                    int py = toINT(projectile->curPos.y - projectile->curPos.dy);
+                    result = checkForCircleCollision(sx, sy, shipRadius,
+                                                     px, py, PROJECTILE_RADIUS);
+                }
+            }
         }
         if(result != 0)
         {

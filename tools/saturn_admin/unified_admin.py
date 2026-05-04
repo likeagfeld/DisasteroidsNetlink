@@ -40,6 +40,8 @@ GAMES = [
     ("coup",         "Coup",            9090),
     ("flicky",       "Flicky's Flock",  9091),
     ("disasteroids", "Disasteroids",    9092),
+    ("utenyaa",      "Utenyaa",         9093),
+    ("mmm",          "Micro Motor Mayhem", 9094),
 ]
 
 UPSTREAM_TIMEOUT = 3.0
@@ -53,6 +55,8 @@ CARD_ORDER = [
     "wave", "asteroids_left", "ships_alive",
     "active_pipes", "pipe_speed",
     "room_state", "turn", "deck_remaining",
+    "track_id", "current_lap", "lap_count", "racers_finished",
+    "total_connects_today",
 ]
 CARD_LABELS = {
     "active":            "Game",
@@ -69,6 +73,11 @@ CARD_LABELS = {
     "room_state":        "Room",
     "turn":              "Turn",
     "deck_remaining":    "Deck",
+    "track_id":              "Track",
+    "current_lap":           "Lap",
+    "lap_count":             "Laps",
+    "racers_finished":       "Finished",
+    "total_connects_today":  "Joins Today",
 }
 
 
@@ -127,6 +136,133 @@ def _render_admin_html() -> bytes:
             '<button class="%s" data-slug="%s" onclick="showTab(\'%s\')">%s</button>'
             % (cls_tab, slug, slug, label))
 
+        # MMM-specific control panel and live join-history table.
+        mmm_panel = ""
+        mmm_history_panel = ""
+        if slug == "mmm":
+            track_options = "".join(
+                "<option value=\"%d\">%d</option>" % (i, i)
+                for i in range(1, 16))
+            lap_options = "".join(
+                "<option value=\"%d\">%d</option>" % (i, i)
+                for i in range(1, 10))
+            respawn_options = "".join(
+                "<option value=\"%d\">%ds</option>" % (i, i)
+                for i in (0, 4, 6, 8, 10, 15, 20, 30))
+            mmm_panel = f"""
+  <div class="panel mmm-panel">
+    <h3>MMM Race Controls</h3>
+    <div class="mmm-row">
+      <span class="mmm-label">Bots:</span>
+      <button class="btn" onclick="mmmBot('{slug}','remove')">-</button>
+      <span class="mmm-bot-count" style="min-width:24px;text-align:center">0</span>
+      <button class="btn" onclick="mmmBot('{slug}','add')">+</button>
+    </div>
+    <div class="mmm-row">
+      <label class="mmm-label"><input type="checkbox" class="mmm-rand-track"> Random track</label>
+      <span class="mmm-label">Forced track:</span>
+      <select class="mmm-forced-track">{track_options}</select>
+    </div>
+    <div class="mmm-row">
+      <span class="mmm-label">Lap count:</span>
+      <select class="mmm-lap-count">{lap_options}</select>
+      <span class="mmm-label">Powerup respawn:</span>
+      <select class="mmm-pup-respawn">{respawn_options}</select>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn" onclick="mmmApplyTune('{slug}')">Apply</button>
+      <button class="btn btn-warn" onclick="mmmForceEnd('{slug}')">Force end race</button>
+    </div>
+  </div>"""
+            mmm_history_panel = f"""
+  <div class="panel">
+    <h3>Join History (Last 20)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Event</th><th>Name</th><th>IP</th><th>Reason</th></tr></thead>
+        <tbody class="mmm-jh-table"></tbody>
+      </table>
+    </div>
+  </div>"""
+
+        # Utenyaa-specific stage toggles. Each checkbox POSTs to
+        # /api/utenyaa/tune?key=stage_enabled_<name>&value=<true|false>
+        # which the userver.py admin endpoint translates into a tune
+        # dict update. _pick_stage honors the mask on every match start.
+        # CROSS unchecked by default — its road/grass intersection
+        # geometry has tank-collision dead spots; will be re-enabled
+        # once geometry is patched.
+        utenyaa_stage_panel = ""
+        utenyaa_history_panel = ""
+        if slug == "utenyaa":
+            utenyaa_stage_panel = f"""
+  <div class="panel utenyaa-stage-panel">
+    <h3>Stage Pool <span class="muted" style="font-weight:normal;font-size:13px">(checked stages eligible for next match)</span></h3>
+    <div class="tuning-knobs">
+      <label><input type="checkbox" class="utenyaa-stage" data-stage-key="stage_enabled_island"> Island</label>
+      <label><input type="checkbox" class="utenyaa-stage" data-stage-key="stage_enabled_cross"> Cross <span class="muted">(known issue: tank gets stuck at road/grass intersections)</span></label>
+      <label><input type="checkbox" class="utenyaa-stage" data-stage-key="stage_enabled_valley"> Valley</label>
+      <label><input type="checkbox" class="utenyaa-stage" data-stage-key="stage_enabled_railway"> Railway</label>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn" onclick="utenyaaApplyStages('{slug}')">Apply</button>
+      <span class="utenyaa-stage-status muted" style="margin-left:10px"></span>
+    </div>
+  </div>"""
+            utenyaa_history_panel = f"""
+  <div class="panel">
+    <h3>Join History (Last 200)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Event</th><th>Name</th><th>IP</th><th>Reason</th></tr></thead>
+        <tbody class="utenyaa-jh-table"></tbody>
+      </table>
+    </div>
+  </div>"""
+
+        # Disasteroids-specific join-history table. Mirrors the Utenyaa
+        # panel and consumes /api/disasteroids/join_history (epoch `t`
+        # rendered client-side via toLocaleString).
+        disasteroids_history_panel = ""
+        if slug == "disasteroids":
+            disasteroids_history_panel = f"""
+  <div class="panel">
+    <h3>Join History (Last 200)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Event</th><th>Name</th><th>IP</th><th>Reason</th></tr></thead>
+        <tbody class="disasteroids-jh-table"></tbody>
+      </table>
+    </div>
+  </div>"""
+
+        # Sync-engine panel — toggles client rendering between LERP
+        # (current single-snapshot lerp+extrap) and RING (Utenyaa-style
+        # snapshot ring + interp/extrap). LERP is the known-good default;
+        # RING activates only on clients built with the Phase 3+ binary.
+        sync_panel = ""
+        if slug == "disasteroids":
+            sync_panel = f"""
+  <div class="panel sync-panel">
+    <h3>Sync Engine <span class="sync-badge"></span></h3>
+    <p class="muted" style="margin-bottom:8px">
+      Switches how clients render remote ships. <b>LERP</b> = current
+      single-snapshot lerp + 3-frame forward extrapolation (known-good).
+      <b>RING</b> = snapshot ring + bracketing-pair interpolation + velocity
+      extrapolation (Utenyaa-style; smoother under jitter, requires a
+      client binary built with the new sync code). Switching mid-match
+      takes effect on the next match start.
+    </p>
+    <div class="tuning-presets">
+      <label><input type="radio" name="syncmode-{slug}" value="LERP"> LERP <span class="muted">(default, current)</span></label>
+      <label><input type="radio" name="syncmode-{slug}" value="RING"> RING <span class="muted">(Utenyaa-style)</span></label>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn" onclick="applySyncMode('{slug}')">Apply</button>
+      <button class="btn btn-warn" onclick="applySyncModeDirect('{slug}','LERP')">Revert to LERP</button>
+    </div>
+  </div>"""
+
         # Tuning panel only rendered (and populated) for Disasteroids.
         tuning_panel = ""
         if slug == "disasteroids":
@@ -184,7 +320,7 @@ def _render_admin_html() -> bytes:
     <h3>Server Status</h3>
     <div class="cards"></div>
   </div>
-{tuning_panel}
+{tuning_panel}{sync_panel}{utenyaa_stage_panel}{mmm_panel}{mmm_history_panel}
   <div class="panel">
     <h3>Connected Players</h3>
     <div class="table-wrap">
@@ -206,15 +342,7 @@ def _render_admin_html() -> bytes:
     </div>
   </div>
 
-  <div class="panel">
-    <h3>Join History (Last 200)</h3>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Time</th><th>Name</th><th>IP</th><th>Event</th></tr></thead>
-        <tbody class="htable"></tbody>
-      </table>
-    </div>
-  </div>
+{disasteroids_history_panel}{utenyaa_history_panel}
 </div>""")
 
     html = """<!DOCTYPE html>
@@ -261,6 +389,9 @@ tr:hover{background:#1a2744}
 .tuning-panel .tuning-badge.b-aggressive{background:#e94560;color:#fff}
 .tuning-panel .tuning-badge.b-auto{background:#9b59b6;color:#fff}
 .tuning-panel .tuning-badge.b-custom{background:#7f8c8d;color:#fff}
+.sync-panel h3 .sync-badge{font-size:11px;padding:2px 6px;border-radius:3px;margin-left:8px;vertical-align:middle}
+.sync-panel .sync-badge.b-lerp{background:#2ecc71;color:#000}
+.sync-panel .sync-badge.b-ring{background:#9b59b6;color:#fff}
 .tuning-presets{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0}
 .tuning-presets label{cursor:pointer;padding:6px 10px;background:#0f1a2e;border-radius:3px;font-size:13px}
 .tuning-estimate{margin-top:6px;font-family:monospace;background:#0f1a2e;padding:8px;border-radius:3px}
@@ -270,6 +401,9 @@ tr:hover{background:#1a2744}
 .tuning-knobs label{font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .tuning-knobs input[type=number]{width:70px;background:#0f1a2e;color:#e0e0e0;border:1px solid #333;padding:4px 6px;border-radius:3px;font-family:inherit}
 .tuning-knobs input[type=number]:disabled{opacity:0.5;cursor:not-allowed}
+.mmm-panel .mmm-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:6px 0}
+.mmm-panel .mmm-label{font-size:13px;color:#bbb}
+.mmm-panel select{background:#0f1a2e;color:#e0e0e0;border:1px solid #333;padding:4px 6px;border-radius:3px;font-family:inherit}
 @media(max-width:699px){body{padding:8px}}
 </style></head><body>
 <h1>Saturn NetLink Admin</h1>
@@ -297,7 +431,6 @@ function showTab(slug){
   $$('.tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-slug')===slug)});
   $$('.tab-content').forEach(function(p){p.classList.toggle('active',p.getAttribute('data-slug')===slug)});
   refresh(slug);
-  loadHistory(slug);
 }
 
 function showMsg(t,c){
@@ -506,7 +639,60 @@ function refreshTuning(slug){
   if(!$('.tuning-panel',pane))return;  // other tabs have no tuning panel
   api('GET',slug,'tuning').then(function(d){
     renderTuning(slug,d);
+    renderSyncMode(slug,d);
   }).catch(function(){});
+}
+
+// ------- Sync engine (LERP/RING) -------
+var syncDirty={};  // slug -> true while user has unapplied selection
+function wireSyncInputs(slug){
+  var sp=$('.sync-panel',panel(slug));
+  if(!sp||sp.__wired)return;
+  sp.__wired=true;
+  $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){
+    r.addEventListener('change',function(){syncDirty[slug]=true;
+      // Visual hint matching the bandwidth panel pattern.
+      var b=$('.sync-badge',sp);
+      if(b)b.textContent=(b.textContent.replace(/ \\(pending.*$/,''))+' (pending — click Apply)';
+    });
+  });
+}
+function renderSyncMode(slug,d){
+  var sp=$('.sync-panel',panel(slug));
+  if(!sp||!d||!d.tuning)return;
+  wireSyncInputs(slug);
+  var mode=d.tuning.sync_mode||'LERP';
+  if(!syncDirty[slug]){
+    $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){
+      r.checked=(r.value===mode);
+    });
+  }
+  var badge=$('.sync-badge',sp);
+  if(badge){
+    badge.className='sync-badge b-'+mode.toLowerCase();
+    badge.textContent=mode+(syncDirty[slug]?' (pending — click Apply)':'');
+  }
+}
+function applySyncMode(slug){
+  var sp=$('.sync-panel',panel(slug));
+  if(!sp)return;
+  var mode=null;
+  $$('input[name=syncmode-'+slug+']',sp).forEach(function(r){if(r.checked)mode=r.value;});
+  if(!mode){showMsg('Pick a sync mode first','#d32f2f');return;}
+  api('POST',slug,'tuning',{sync_mode:mode}).then(function(r){
+    if(r.error){showMsg('Sync error: '+r.error,'#d32f2f');return;}
+    showMsg('Sync mode set to '+mode);
+    syncDirty[slug]=false;
+    refreshTuning(slug);
+  }).catch(function(e){showMsg('Sync apply failed: '+e.message,'#d32f2f');});
+}
+function applySyncModeDirect(slug,mode){
+  api('POST',slug,'tuning',{sync_mode:mode}).then(function(r){
+    if(r.error){showMsg('Sync error: '+r.error,'#d32f2f');return;}
+    showMsg('Sync mode set to '+mode);
+    syncDirty[slug]=false;
+    refreshTuning(slug);
+  }).catch(function(e){showMsg('Sync apply failed: '+e.message,'#d32f2f');});
 }
 
 function refresh(slug){
@@ -519,9 +705,22 @@ function refresh(slug){
     renderPlayers(slug,d.players||[]);
     // /api/state also carries tuning for the disasteroids tab; render if present.
     if(d.tuning){
-      renderTuning(slug,{tuning:d.tuning,auto_mode:d.tuning.auto_mode,
-                         auto_current:d.tuning.auto_current,
-                         player_count:d.tuning.player_count});
+      var tWrapped={tuning:d.tuning,auto_mode:d.tuning.auto_mode,
+                    auto_current:d.tuning.auto_current,
+                    player_count:d.tuning.player_count};
+      renderTuning(slug,tWrapped);
+      renderSyncMode(slug,tWrapped);
+    }
+    if(slug==='mmm'){
+      renderMMMTuning(slug,d);
+      loadMMMJoinHistory(slug);
+    }
+    if(slug==='utenyaa'){
+      utenyaaLoadStages(slug);
+      utenyaaLoadJoinHistory(slug);
+    }
+    if(slug==='disasteroids'){
+      loadDisasteroidsJoinHistory(slug);
     }
   }).catch(function(){
     $('.status_dot',pane).style.color='#d32f2f';
@@ -531,30 +730,211 @@ function refresh(slug){
   });
 }
 
-function loadHistory(slug){
+// ------- MMM-specific helpers -------
+var mmmDirty={};  // slug -> true while user has unapplied form changes
+function wireMMMInputs(slug){
   var pane=panel(slug);
-  var tb=$('.htable',pane);
-  api('GET',slug,'history').then(function(d){
-    tb.innerHTML='';
-    (d.entries||[]).forEach(function(e){
-      var tr=document.createElement('tr');
-      tr.innerHTML='<td>'+e.time+'</td><td>'+e.name+'</td><td>'+e.ip+'</td><td>'+e.event+'</td>';
-      tb.appendChild(tr);
+  var tp=$('.mmm-panel',pane);
+  if(!tp||tp.__wired)return;
+  tp.__wired=true;
+  ['.mmm-rand-track','.mmm-forced-track','.mmm-lap-count','.mmm-pup-respawn']
+    .forEach(function(sel){
+      var el=$(sel,tp);
+      if(!el)return;
+      el.addEventListener('change',function(){mmmDirty[slug]=true;});
+      el.addEventListener('input',function(){mmmDirty[slug]=true;});
     });
-    if(!(d.entries||[]).length){
-      tb.innerHTML='<tr><td colspan="4" style="color:#888;text-align:center">No history</td></tr>';
-    }
-  }).catch(function(err){
-    // A 404 means the per-game server doesn't expose history; not a real
-    // error. Anything else (502 upstream offline, network failure, etc.)
-    // is a real problem worth flagging in red.
-    if(err && err.status===404){
-      tb.innerHTML='<tr><td colspan="4" style="color:#888;text-align:center">Not tracked on this server</td></tr>';
-    } else {
-      tb.innerHTML='<tr><td colspan="4" class="offline">Unavailable</td></tr>';
-    }
+}
+function renderMMMTuning(slug,d){
+  var pane=panel(slug);
+  var tp=$('.mmm-panel',pane);
+  if(!tp)return;
+  wireMMMInputs(slug);
+  // Player count = humans + bots from game dict.
+  var g=d.game||{};
+  $('.mmm-bot-count',tp).textContent=String(g.bot_count==null?0:g.bot_count);
+  if(mmmDirty[slug])return;  // do not stomp user edits mid-form
+  var t=d.tuning||{};
+  if($('.mmm-rand-track',tp))$('.mmm-rand-track',tp).checked=!!t.random_track;
+  if($('.mmm-forced-track',tp)&&t.forced_track_id!=null)
+    $('.mmm-forced-track',tp).value=String(t.forced_track_id);
+  if($('.mmm-lap-count',tp)&&t.lap_count!=null)
+    $('.mmm-lap-count',tp).value=String(t.lap_count);
+  if($('.mmm-pup-respawn',tp)&&t.powerup_respawn_secs!=null)
+    $('.mmm-pup-respawn',tp).value=String(t.powerup_respawn_secs);
+}
+function mmmBot(slug,direction){
+  var endpoint=(direction==='add'?'add_bot':'remove_bot');
+  api('POST',slug,endpoint,{}).then(function(r){
+    if(r.message)showMsg(r.message);refresh(slug);
+  }).catch(function(e){showMsg('Bot '+direction+' failed: '+e.message,'#d32f2f');});
+}
+function mmmTuneOne(slug,key,val){
+  return api('POST',slug,'tune?key='+encodeURIComponent(key)+
+                       '&value='+encodeURIComponent(val),{});
+}
+function mmmApplyTune(slug){
+  var tp=$('.mmm-panel',panel(slug));
+  if(!tp)return;
+  var rand=$('.mmm-rand-track',tp).checked;
+  var ftrack=$('.mmm-forced-track',tp).value;
+  var laps=$('.mmm-lap-count',tp).value;
+  var respawn=$('.mmm-pup-respawn',tp).value;
+  Promise.all([
+    mmmTuneOne(slug,'random_track',rand?'true':'false'),
+    mmmTuneOne(slug,'forced_track_id',ftrack),
+    mmmTuneOne(slug,'lap_count',laps),
+    mmmTuneOne(slug,'powerup_respawn_secs',respawn)
+  ]).then(function(){
+    showMsg('MMM tuning applied');
+    mmmDirty[slug]=false;
+    refresh(slug);
+  }).catch(function(e){
+    showMsg('Apply failed: '+e.message,'#d32f2f');
   });
 }
+/* === Utenyaa stage-pool toggles ===
+ * Each checkbox in the Utenyaa tab maps to a server tune key
+ * (stage_enabled_island/cross/valley/railway). userver.py's admin
+ * endpoint uses PATH-style: GET /api/tune returns the full dict;
+ * POST /api/tune/<key> with body {"value": <bool>} updates one. */
+function utenyaaLoadStages(slug){
+  var pane=panel(slug);
+  if(!pane)return;
+  var nodes=pane.querySelectorAll('.utenyaa-stage');
+  if(!nodes.length)return;
+  api('GET',slug,'tune').then(function(d){
+    if(!d)return;
+    nodes.forEach(function(box){
+      var k=box.getAttribute('data-stage-key');
+      if(typeof d[k]!=='undefined')box.checked=!!d[k];
+    });
+  }).catch(function(){/* leave at default */});
+}
+function utenyaaApplyStages(slug){
+  var pane=panel(slug);
+  if(!pane)return;
+  var nodes=pane.querySelectorAll('.utenyaa-stage');
+  var status=pane.querySelector('.utenyaa-stage-status');
+  if(!nodes.length)return;
+  var anyChecked=false;
+  nodes.forEach(function(b){if(b.checked)anyChecked=true;});
+  if(!anyChecked){
+    if(status){status.textContent='Need at least one stage enabled.';status.style.color='#d32f2f';}
+    return;
+  }
+  var promises=[];
+  nodes.forEach(function(box){
+    var k=box.getAttribute('data-stage-key');
+    promises.push(api('POST',slug,'tune/'+encodeURIComponent(k),{value:!!box.checked}));
+  });
+  Promise.all(promises).then(function(){
+    if(status){status.textContent='Applied at '+new Date().toLocaleTimeString();status.style.color='#2ecc71';}
+  }).catch(function(e){
+    if(status){status.textContent='Apply failed: '+e.message;status.style.color='#d32f2f';}
+  });
+}
+function utenyaaLoadJoinHistory(slug){
+  var pane=panel(slug);
+  var tb=$('.utenyaa-jh-table',pane);
+  if(!tb)return;
+  api('GET',slug,'join_history?limit=200').then(function(d){
+    tb.innerHTML='';
+    var rows=(d&&d.events)||[];
+    if(!rows.length){
+      tb.innerHTML='<tr><td colspan="5" style="color:#888;text-align:center">No events yet</td></tr>';
+      return;
+    }
+    rows.forEach(function(ev){
+      var tr=document.createElement('tr');
+      var dt=ev.t?new Date(ev.t*1000):null;
+      var when=dt?dt.toLocaleString():'-';
+      var evtype=ev.event||'?';
+      var color={
+        'join':'#2ecc71','rejoin':'#3498db',
+        'leave':'#e67e22','kick':'#e94560','timeout':'#9b59b6'
+      }[evtype]||'#aaa';
+      tr.innerHTML=
+        '<td style="white-space:nowrap">'+when+'</td>'+
+        '<td style="color:'+color+';font-weight:600">'+evtype+'</td>'+
+        '<td>'+(ev.name||'')+'</td>'+
+        '<td style="font-family:monospace;font-size:12px">'+(ev.ip||'')+'</td>'+
+        '<td class="muted">'+(ev.reason||'')+'</td>';
+      tb.appendChild(tr);
+    });
+  }).catch(function(){
+    tb.innerHTML='<tr><td colspan="5" style="color:#d32f2f;text-align:center">offline</td></tr>';
+  });
+}
+function mmmForceEnd(slug){
+  if(!confirm('Force end the current MMM race?'))return;
+  api('POST',slug,'force_end_race',{}).then(function(r){
+    if(r.message)showMsg(r.message,'#e94560');refresh(slug);
+  }).catch(function(e){showMsg('Force-end failed: '+e.message,'#d32f2f');});
+}
+function loadMMMJoinHistory(slug){
+  var pane=panel(slug);
+  var tb=$('.mmm-jh-table',pane);
+  if(!tb)return;
+  api('GET',slug,'join_history?limit=20').then(function(d){
+    tb.innerHTML='';
+    var rows=d.events||[];
+    if(!rows.length){
+      tb.innerHTML='<tr><td colspan="5" style="color:#888;text-align:center">No events yet</td></tr>';
+      return;
+    }
+    rows.forEach(function(e){
+      var tr=document.createElement('tr');
+      tr.innerHTML='<td>'+(e.ts||'-')+'</td>'
+        +'<td>'+(e.event||'-')+'</td>'
+        +'<td>'+(e.name||'-')+'</td>'
+        +'<td>'+(e.ip||'-')+'</td>'
+        +'<td>'+(e.reason||'-')+'</td>';
+      tb.appendChild(tr);
+    });
+  }).catch(function(){
+    tb.innerHTML='<tr><td colspan="5" class="offline">Unavailable</td></tr>';
+  });
+}
+
+function loadDisasteroidsJoinHistory(slug){
+  var pane=panel(slug);
+  var tb=$('.disasteroids-jh-table',pane);
+  if(!tb)return;
+  api('GET',slug,'join_history?limit=200').then(function(d){
+    tb.innerHTML='';
+    var rows=(d&&d.events)||[];
+    if(!rows.length){
+      tb.innerHTML='<tr><td colspan="5" style="color:#888;text-align:center">No events yet</td></tr>';
+      return;
+    }
+    rows.forEach(function(ev){
+      var tr=document.createElement('tr');
+      var dt=ev.t?new Date(ev.t*1000):null;
+      var when=dt?dt.toLocaleString():(ev.ts||'-');
+      var evtype=ev.event||'?';
+      var color={
+        'join':'#2ecc71','rejoin':'#3498db',
+        'leave':'#e67e22','kick':'#e94560','timeout':'#9b59b6'
+      }[evtype]||'#aaa';
+      tr.innerHTML=
+        '<td style="white-space:nowrap">'+when+'</td>'+
+        '<td style="color:'+color+';font-weight:600">'+evtype+'</td>'+
+        '<td>'+(ev.name||'')+'</td>'+
+        '<td style="font-family:monospace;font-size:12px">'+(ev.ip||'')+'</td>'+
+        '<td class="muted">'+(ev.reason||'')+'</td>';
+      tb.appendChild(tr);
+    });
+  }).catch(function(){
+    tb.innerHTML='<tr><td colspan="5" style="color:#d32f2f;text-align:center">offline</td></tr>';
+  });
+}
+
+/* loadHistory() removed: was a global per-tab dead-end that called the
+ * non-existent /api/<slug>/history endpoint and showed "Not tracked on
+ * this server" as a duplicate of the working per-game history panels.
+ * Each game's history is now rendered via its own dedicated loader
+ * (utenyaaLoadJoinHistory, loadMMMJoinHistory, loadDisasteroidsJoinHistory). */
 
 function kick(slug,uuid,name){
   if(!confirm('Kick '+name+' from '+slug+'?'))return;
@@ -588,7 +968,7 @@ function tick(){
 }
 
 // Initial render for every tab so each one has dashboard data if user switches.
-GAMES.forEach(function(g){refresh(g.slug);loadHistory(g.slug);refreshTuning(g.slug);});
+GAMES.forEach(function(g){refresh(g.slug);refreshTuning(g.slug);});
 setInterval(tick,1000);
 </script></body></html>"""
     html = (html
@@ -626,7 +1006,9 @@ class AdminHandler(BaseHTTPRequestHandler):
         self._send(status, body or b"{}", "application/json")
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parsed.query
         if path == "/" or path == "":
             self._send(200, ADMIN_HTML, "text/html; charset=utf-8")
             return
@@ -637,26 +1019,52 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         # /api/<slug>/<endpoint>
         parts = path.strip("/").split("/")
-        if len(parts) == 3 and parts[0] == "api" and parts[2] in ("state", "history", "tuning"):
+        if len(parts) == 3 and parts[0] == "api" and parts[2] in (
+                "state", "history", "tuning", "tune",
+                "join_history", "leaderboard", "client_logs"):
             port = _port_for(parts[1])
             if not port:
                 self.send_error(404); return
-            status, body = _upstream_get(port, "/api/" + parts[2])
+            upstream_path = "/api/" + parts[2]
+            if query:
+                upstream_path += "?" + query
+            status, body = _upstream_get(port, upstream_path)
             self._send_upstream(status, body)
             return
         self.send_error(404)
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parsed.query
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len) if content_len > 0 else b""
         parts = path.strip("/").split("/")
         if (len(parts) == 3 and parts[0] == "api"
-                and parts[2] in ("kick", "end_game", "restart", "tuning")):
+                and parts[2] in (
+                    "kick", "end_game", "restart", "tuning",
+                    "add_bot", "remove_bot", "force_end_race", "tune",
+                    "upload_waypoints", "control")):
             port = _port_for(parts[1])
             if not port:
                 self.send_error(404); return
-            status, resp = _upstream_post(port, "/api/" + parts[2], body)
+            upstream_path = "/api/" + parts[2]
+            if query:
+                upstream_path += "?" + query
+            status, resp = _upstream_post(port, upstream_path, body)
+            self._send_upstream(status, resp)
+            return
+        # Path-style tune: /api/<slug>/tune/<key>  (used by Utenyaa to
+        # write a single named tune knob with a JSON body {value:...}).
+        if (len(parts) == 4 and parts[0] == "api"
+                and parts[2] in ("tune", "kick")):
+            port = _port_for(parts[1])
+            if not port:
+                self.send_error(404); return
+            upstream_path = "/api/" + parts[2] + "/" + parts[3]
+            if query:
+                upstream_path += "?" + query
+            status, resp = _upstream_post(port, upstream_path, body)
             self._send_upstream(status, resp)
             return
         self.send_error(404)

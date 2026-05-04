@@ -434,6 +434,11 @@ static void getOnlinePlayersInput(void)
             }
         }
     }
+
+    // RING sync: drive remote ships from the snapshot ring (interp+extrap).
+    // No-op when sync_mode==LERP, so the existing behavior is unchanged
+    // unless the server has flipped the engine via SET_SYNC_MODE.
+    dnet_apply_remote_snapshots();
 }
 
 // update players
