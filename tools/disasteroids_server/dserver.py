@@ -1284,7 +1284,13 @@ class DisasteroidsServer:
             "stationary_vel_threshold": 2,     # |dx|+|dy| below this = stationary
             "ship_sync_keepalive_ticks": 60,   # force relay every N server ticks
             "bot_sync_every_n_ticks": 1,       # 1=20Hz, 2=10Hz, 3≈7Hz, 4=5Hz
-            "sync_mode": "LERP",               # LERP | RING (toggle for Utenyaa-style sync)
+            # Default flipped to RING in v1.1.2 after the Saturn-side
+            # jitter fix landed. Old binaries (pre-1.1.0) still get LERP
+            # automatically because they don't announce CLIENT_CAPS — see
+            # _send_sync_mode_to() which forces LERP for non-ring-capable
+            # clients. New v1.1.0+ binaries activate RING on connect.
+            "sync_mode": "RING",
+
             # v1.1.1 — asteroid drift correction. Only takes effect when
             # sync_mode==RING. Server enables: (a) wall-clock catch-up loop
             # in the tick scheduler, (b) Saturn-matching edge-snap wrap, and
