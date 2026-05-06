@@ -545,19 +545,32 @@ function renderPlayers(slug,players){
     tb.innerHTML='<tr><td colspan="8" style="color:#888;text-align:center">No players connected</td></tr>';
     return;
   }
+  // Defensive — different game backends emit slightly different player
+  // shapes (Coup uses `username`/`uuid`/`status`/`idle`/`egress_bps`;
+  // Utenyaa uses `name`/`id`/`ready`/`in_game` and lacks `egress_bps`,
+  // `idle`, `uuid`, etc.). Treat every field as optional and fall
+  // back gracefully so a missing field can't throw and trip the
+  // outer .catch into showing the tab as "offline" — that bug ate
+  // the Utenyaa tab in alpha-0.6 (renderPlayers crashed on
+  // p.username.replace() when the server emitted `name`).
   players.forEach(function(p){
+    var name = String(p.username || p.name || ('#'+(p.id==null?'?':p.id)));
+    var status = p.status || (p.in_game ? 'in-game' : (p.ready ? 'ready' : 'lobby'));
     var sc='status-lobby';
-    if(p.status==='in-game')sc='status-ingame';
-    else if(p.status==='dead')sc='status-dead';
+    if(status==='in-game')sc='status-ingame';
+    else if(status==='dead')sc='status-dead';
     var bps=(p.egress_bps==null)?'-':(p.egress_bps+' B/s');
+    var idleStr=(p.idle==null)?'-':fmtTime(p.idle);
+    var kid = String(p.uuid==null?(p.id==null?'':p.id):p.uuid);
+    var score = (p.score==null) ? (p.character==null?0:p.character) : p.score;
     var tr=document.createElement('tr');
-    tr.innerHTML='<td><b>'+p.username+'</b></td>'
-      +'<td><span class="status '+sc+'">'+p.status+'</span></td>'
-      +'<td>'+(p.score||0)+'</td><td>'+(p.deaths||0)+'</td>'
-      +'<td>'+p.address+'</td>'
-      +'<td>'+fmtTime(p.idle)+'</td>'
+    tr.innerHTML='<td><b>'+name+'</b></td>'
+      +'<td><span class="status '+sc+'">'+status+'</span></td>'
+      +'<td>'+score+'</td><td>'+(p.deaths||0)+'</td>'
+      +'<td>'+(p.address||'-')+'</td>'
+      +'<td>'+idleStr+'</td>'
       +'<td>'+bps+'</td>'
-      +'<td><button class="btn" onclick="kick(\\''+slug+'\\',\\''+p.uuid+'\\',\\''+p.username.replace(/\\'/g,"")+'\\')">Kick</button></td>';
+      +'<td><button class="btn" onclick="kick(\\''+slug+'\\',\\''+kid+'\\',\\''+name.replace(/\\'/g,"")+'\\')">Kick</button></td>';
     tb.appendChild(tr);
   });
 }
@@ -1222,6 +1235,14 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        # Don't let the browser cache the portal HTML or the JSON API
+        # responses — admin updates change behavior, and a stale tab
+        # showing "offline" because it has the old JS is a confusing
+        # failure mode (observed when the Map Editor consolidation
+        # ship left users with cached pre-consolidation HTML/JS).
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
         self.close_connection = True
