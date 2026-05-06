@@ -211,9 +211,21 @@ def _render_admin_html() -> bytes:
 
     <hr style="border:0;border-top:1px solid #222;margin:14px 0">
 
-    <h3 style="margin-top:6px">Live Custom Map
-      <span class="muted" style="font-weight:normal;font-size:13px">(streamed to Saturn over NetLink — overrides Stage Pool)</span>
+    <h3 style="margin-top:6px">Custom Maps
+      <span class="muted" style="font-weight:normal;font-size:13px">(authored in the editor; streamed to Saturn over NetLink)</span>
     </h3>
+    <p class="muted" style="margin-bottom:10px;font-size:13px">
+      Saturn malloc pool is 250&nbsp;KB; each streamed map allocates a buffer for
+      its bytes. Hard cap is <b>16&nbsp;KB per map</b> (UNET_MAP_MAX_SIZE);
+      typical hand-authored maps are ~10–11&nbsp;KB. Wire-transfer time over
+      14.4k baud is ~<span class="utenyaa-eta">8 s</span> for a typical map.
+      When enabled, every match runs on the selected map (Stage Pool above is bypassed).
+    </p>
+    <div class="controls" style="margin-bottom:10px">
+      <a class="btn" href="editor/" target="_blank" rel="noopener">Open Map Editor &raquo;</a>
+      <button class="btn" onclick="refreshCustomMaps()">Refresh map list</button>
+      <span class="me-status muted" style="margin-left:10px"></span>
+    </div>
     <div class="tuning-knobs">
       <label><input type="checkbox" class="utenyaa-use-live-map">
         Use live custom map (every match streams it)
@@ -221,7 +233,7 @@ def _render_admin_html() -> bytes:
       <label>
         Map:
         <select class="utenyaa-live-map-slug">
-          <option value="">(none — pick one in the Map Editor tab)</option>
+          <option value="">(none)</option>
         </select>
         <span class="utenyaa-live-map-info muted" style="margin-left:8px"></span>
       </label>
@@ -229,6 +241,14 @@ def _render_admin_html() -> bytes:
     <div class="controls" style="margin-top:10px">
       <button class="btn" onclick="utenyaaApplyLiveMap('{slug}')">Apply</button>
       <span class="utenyaa-livemap-status muted" style="margin-left:10px"></span>
+    </div>
+    <div class="table-wrap" style="margin-top:14px">
+      <table>
+        <thead><tr>
+          <th>Slug</th><th>Filename</th><th>Size</th><th>vs. cap</th><th>Saved</th><th>Action</th>
+        </tr></thead>
+        <tbody class="me-maps-table"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+      </table>
     </div>
   </div>"""
             utenyaa_history_panel = f"""
@@ -374,74 +394,10 @@ def _render_admin_html() -> bytes:
 {disasteroids_history_panel}{utenyaa_history_panel}
 </div>""")
 
-    # Map Editor tab — launcher + live-map controller.
-    # Iframes were tried first, but the editor's 3D preview and
-    # texture grid want the full viewport, and iframes have
-    # subtle auth/sizing/back-button quirks. The cleaner UX:
-    # editor opens in its own browser tab; this panel is a
-    # launcher plus a live-map manager that mirrors the Utenyaa
-    # tab's "Live Custom Map" controls (single source of truth
-    # — both panels write the same userver tune keys).
-    tab_buttons.append(
-        '<button class="tab" data-slug="mapeditor" onclick="showTab(\'mapeditor\')">Map Editor</button>')
-    tab_panels.append("""
-<div id="tab-mapeditor" class="tab-content" data-slug="mapeditor">
-  <div class="panel">
-    <h3>Author maps</h3>
-    <p class="muted" style="margin-bottom:10px">
-      The web editor authors <code>.UTE</code> map files byte-identical
-      to PawCraft. Saved maps land on the server filesystem and are
-      automatically picked up by the live-map dropdown below.
-    </p>
-    <div class="controls">
-      <a class="btn" href="editor/" target="_blank" rel="noopener">Open Map Editor &raquo;</a>
-      <button class="btn" onclick="refreshCustomMaps()">Refresh map list</button>
-      <span class="me-status muted" style="margin-left:10px"></span>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h3>Live Custom Map
-      <span class="muted" style="font-weight:normal;font-size:13px">(streamed to Saturn before each match)</span>
-    </h3>
-    <p class="muted" style="margin-bottom:10px">
-      When enabled, every match starts on the selected custom map —
-      the four baked-in stages (Island/Cross/Valley/Railway) are
-      bypassed. Map bytes are pushed to all connected Saturns over
-      NetLink before <code>GAME_START</code>.
-      Wire transfer time at 14.4k ≈ <span class="me-eta">8 s</span>
-      for a typical 11&nbsp;KB map.
-    </p>
-    <div class="tuning-knobs">
-      <label><input type="checkbox" class="me-use-live-map">
-        Use live custom map
-      </label>
-      <label>
-        Map:
-        <select class="me-live-map-slug">
-          <option value="">(none)</option>
-        </select>
-        <span class="me-live-map-info muted" style="margin-left:8px"></span>
-      </label>
-    </div>
-    <div class="controls" style="margin-top:10px">
-      <button class="btn" onclick="meApplyLiveMap()">Apply</button>
-      <span class="me-apply-status muted" style="margin-left:10px"></span>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h3>Saved maps</h3>
-    <div class="table-wrap">
-      <table>
-        <thead><tr>
-          <th>Slug</th><th>Filename</th><th>Size</th><th>Saved</th><th>Action</th>
-        </tr></thead>
-        <tbody class="me-maps-table"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-</div>""")
+    # Map Editor is consolidated into the Utenyaa tab — see the
+    # "Live Custom Map" sub-panel inside utenyaa_stage_panel above.
+    # No standalone tab; everything Utenyaa-related (stages, custom
+    # maps, saved-maps table, editor launcher) lives in one place.
 
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -528,16 +484,6 @@ function showTab(slug){
   activeSlug=slug;
   $$('.tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-slug')===slug)});
   $$('.tab-content').forEach(function(p){p.classList.toggle('active',p.getAttribute('data-slug')===slug)});
-  // Map Editor tab is a launcher, not a backing game — skip the
-  // standard /api/state poll. But DO populate its dropdown +
-  // saved-maps table from the userver's /api/list_custom_maps
-  // (which lives under the utenyaa slug since that's the server
-  // that knows the editor's maps dir). Fire-and-forget; errors
-  // surface inside the panel.
-  if(slug==='mapeditor'){
-    if(typeof refreshCustomMaps==='function')refreshCustomMaps();
-    return;
-  }
   refresh(slug);
 }
 
@@ -973,6 +919,9 @@ function utenyaaApplyStages(slug){
  * /api/utenyaa/list_custom_maps which lists .UTE files in the editor's
  * maps dir. */
 var customMapsCache=[];
+// Saturn .UTE protocol cap — must mirror UNET_MAP_MAX_SIZE in
+// src/net/utenyaa_protocol.h. Bumping requires a binary update too.
+var UNET_MAP_MAX_SIZE = 16384;
 
 function fmtKB(n){return (n/1024).toFixed(1)+' KB';}
 function fmtTime(epoch){
@@ -986,25 +935,39 @@ function meEtaSeconds(bytes){
   return Math.max(2, Math.ceil(bytes / 1300));
 }
 
+function capPctText(bytes){
+  var pct = (bytes / UNET_MAP_MAX_SIZE) * 100;
+  var color = pct >= 100 ? '#d32f2f' : pct >= 80 ? '#f5a623' : '#2ecc71';
+  return '<span style="color:'+color+'">'+pct.toFixed(0)+'%</span>'
+       + (pct >= 100 ? ' <b>OVER CAP</b>' : '');
+}
+
 function meWriteRow(tb, m, current_slug){
   var tr=document.createElement('tr');
   var pin = (m.slug===current_slug)?' <span class="status status-ingame">LIVE</span>':'';
+  var overCap = m.size_bytes > UNET_MAP_MAX_SIZE;
+  var pinBtn = overCap
+      ? '<button class="btn" disabled title="Map exceeds UNET_MAP_MAX_SIZE — Saturn will reject">Over cap</button>'
+      : '<button class="btn" data-pin="'+m.slug+'">Pin as live</button>';
   tr.innerHTML =
     '<td><code>'+m.slug+'</code>'+pin+'</td>'+
     '<td>'+(m.filename||'')+'</td>'+
     '<td>'+fmtKB(m.size_bytes)+'</td>'+
+    '<td>'+capPctText(m.size_bytes)+'</td>'+
     '<td>'+fmtTime(m.mtime)+'</td>'+
-    '<td><button class="btn" data-pin="'+m.slug+'">Pin as live</button></td>';
+    '<td>'+pinBtn+'</td>';
   tb.appendChild(tr);
-  var btn=tr.querySelector('button');
-  btn.addEventListener('click',function(){mePinSlug(m.slug);});
+  var btn=tr.querySelector('button[data-pin]');
+  if(btn) btn.addEventListener('click',function(){mePinSlug(m.slug);});
 }
 
 function refreshCustomMaps(){
-  // Both panels share the same dropdown class names — keep in sync.
-  var pane=document.querySelector('#tab-mapeditor');
-  var tb=pane && pane.querySelector('.me-maps-table');
-  var status=pane && pane.querySelector('.me-status');
+  // Now consolidated under the Utenyaa tab — the saved-maps table
+  // and status span live inside the Utenyaa stage panel rather than
+  // a standalone Map Editor tab. Look up by class so multiple deploys
+  // don't break.
+  var tb=document.querySelector('.me-maps-table');
+  var status=document.querySelector('.me-status');
   if(status){status.textContent='Loading…';status.style.color='';}
   return api('GET','utenyaa','list_custom_maps').then(function(d){
     customMapsCache=(d&&d.maps)||[];
@@ -1023,8 +986,10 @@ function refreshCustomMaps(){
       sel.value=current||prev||'';
     });
     document.querySelectorAll('.me-use-live-map,.utenyaa-use-live-map').forEach(function(cb){cb.checked=useLive;});
-    // ETA hint based on currently-selected map
-    document.querySelectorAll('.me-eta').forEach(function(span){
+    // ETA hint based on currently-selected map (both class names
+    // supported — the standalone Map Editor tab used .me-eta, the
+    // consolidated Utenyaa panel uses .utenyaa-eta).
+    document.querySelectorAll('.me-eta,.utenyaa-eta').forEach(function(span){
       var m=customMapsCache.find(function(x){return x.slug===current;});
       span.textContent = m ? meEtaSeconds(m.size_bytes)+' s ('+fmtKB(m.size_bytes)+')' : '8 s';
     });
@@ -1046,7 +1011,7 @@ function refreshCustomMaps(){
     if(tb){
       tb.innerHTML='';
       if(!customMapsCache.length){
-        tb.innerHTML='<tr><td colspan="5" class="muted">No saved maps yet — open the editor to author one.</td></tr>';
+        tb.innerHTML='<tr><td colspan="6" class="muted">No saved maps yet — open the editor to author one.</td></tr>';
       } else {
         customMapsCache.forEach(function(m){meWriteRow(tb,m,current);});
       }
