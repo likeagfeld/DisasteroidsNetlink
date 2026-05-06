@@ -208,6 +208,28 @@ def _render_admin_html() -> bytes:
       <button class="btn" onclick="utenyaaApplyStages('{slug}')">Apply</button>
       <span class="utenyaa-stage-status muted" style="margin-left:10px"></span>
     </div>
+
+    <hr style="border:0;border-top:1px solid #222;margin:14px 0">
+
+    <h3 style="margin-top:6px">Live Custom Map
+      <span class="muted" style="font-weight:normal;font-size:13px">(streamed to Saturn over NetLink — overrides Stage Pool)</span>
+    </h3>
+    <div class="tuning-knobs">
+      <label><input type="checkbox" class="utenyaa-use-live-map">
+        Use live custom map (every match streams it)
+      </label>
+      <label>
+        Map:
+        <select class="utenyaa-live-map-slug">
+          <option value="">(none — pick one in the Map Editor tab)</option>
+        </select>
+        <span class="utenyaa-live-map-info muted" style="margin-left:8px"></span>
+      </label>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn" onclick="utenyaaApplyLiveMap('{slug}')">Apply</button>
+      <span class="utenyaa-livemap-status muted" style="margin-left:10px"></span>
+    </div>
   </div>"""
             utenyaa_history_panel = f"""
   <div class="panel">
@@ -352,6 +374,75 @@ def _render_admin_html() -> bytes:
 {disasteroids_history_panel}{utenyaa_history_panel}
 </div>""")
 
+    # Map Editor tab — launcher + live-map controller.
+    # Iframes were tried first, but the editor's 3D preview and
+    # texture grid want the full viewport, and iframes have
+    # subtle auth/sizing/back-button quirks. The cleaner UX:
+    # editor opens in its own browser tab; this panel is a
+    # launcher plus a live-map manager that mirrors the Utenyaa
+    # tab's "Live Custom Map" controls (single source of truth
+    # — both panels write the same userver tune keys).
+    tab_buttons.append(
+        '<button class="tab" data-slug="mapeditor" onclick="showTab(\'mapeditor\')">Map Editor</button>')
+    tab_panels.append("""
+<div id="tab-mapeditor" class="tab-content" data-slug="mapeditor">
+  <div class="panel">
+    <h3>Author maps</h3>
+    <p class="muted" style="margin-bottom:10px">
+      The web editor authors <code>.UTE</code> map files byte-identical
+      to PawCraft. Saved maps land on the server filesystem and are
+      automatically picked up by the live-map dropdown below.
+    </p>
+    <div class="controls">
+      <a class="btn" href="editor/" target="_blank" rel="noopener">Open Map Editor &raquo;</a>
+      <button class="btn" onclick="refreshCustomMaps()">Refresh map list</button>
+      <span class="me-status muted" style="margin-left:10px"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Live Custom Map
+      <span class="muted" style="font-weight:normal;font-size:13px">(streamed to Saturn before each match)</span>
+    </h3>
+    <p class="muted" style="margin-bottom:10px">
+      When enabled, every match starts on the selected custom map —
+      the four baked-in stages (Island/Cross/Valley/Railway) are
+      bypassed. Map bytes are pushed to all connected Saturns over
+      NetLink before <code>GAME_START</code>.
+      Wire transfer time at 14.4k ≈ <span class="me-eta">8 s</span>
+      for a typical 11&nbsp;KB map.
+    </p>
+    <div class="tuning-knobs">
+      <label><input type="checkbox" class="me-use-live-map">
+        Use live custom map
+      </label>
+      <label>
+        Map:
+        <select class="me-live-map-slug">
+          <option value="">(none)</option>
+        </select>
+        <span class="me-live-map-info muted" style="margin-left:8px"></span>
+      </label>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn" onclick="meApplyLiveMap()">Apply</button>
+      <span class="me-apply-status muted" style="margin-left:10px"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Saved maps</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Slug</th><th>Filename</th><th>Size</th><th>Saved</th><th>Action</th>
+        </tr></thead>
+        <tbody class="me-maps-table"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>""")
+
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Saturn Admin</title>
@@ -437,6 +528,16 @@ function showTab(slug){
   activeSlug=slug;
   $$('.tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-slug')===slug)});
   $$('.tab-content').forEach(function(p){p.classList.toggle('active',p.getAttribute('data-slug')===slug)});
+  // Map Editor tab is a launcher, not a backing game — skip the
+  // standard /api/state poll. But DO populate its dropdown +
+  // saved-maps table from the userver's /api/list_custom_maps
+  // (which lives under the utenyaa slug since that's the server
+  // that knows the editor's maps dir). Fire-and-forget; errors
+  // surface inside the panel.
+  if(slug==='mapeditor'){
+    if(typeof refreshCustomMaps==='function')refreshCustomMaps();
+    return;
+  }
   refresh(slug);
 }
 
@@ -745,6 +846,8 @@ function refresh(slug){
     if(slug==='utenyaa'){
       utenyaaLoadStages(slug);
       utenyaaLoadJoinHistory(slug);
+      // Custom-map dropdown population (shared with Map Editor tab).
+      refreshCustomMaps();
     }
     if(slug==='disasteroids'){
       loadDisasteroidsJoinHistory(slug);
@@ -861,6 +964,141 @@ function utenyaaApplyStages(slug){
     if(status){status.textContent='Apply failed: '+e.message;status.style.color='#d32f2f';}
   });
 }
+/* ---------- Live custom-map controller (shared between Utenyaa tab
+ *            "Live Custom Map" sub-panel and Map Editor tab) ----------
+ *
+ * Single source of truth: the userver tune keys `use_live_map` (bool)
+ * and `live_map_slug` (string). Both panels read/write the same keys
+ * via /api/utenyaa/tune/<key> POST. The dropdown options come from
+ * /api/utenyaa/list_custom_maps which lists .UTE files in the editor's
+ * maps dir. */
+var customMapsCache=[];
+
+function fmtKB(n){return (n/1024).toFixed(1)+' KB';}
+function fmtTime(epoch){
+  if(!epoch)return '';
+  try{return new Date(epoch*1000).toLocaleString();}catch(e){return '';}
+}
+
+function meEtaSeconds(bytes){
+  // 14400 baud / 10 bits per byte = 1440 B/s plus protocol overhead.
+  // Plus a small constant for BEGIN/END frames + chunk headers.
+  return Math.max(2, Math.ceil(bytes / 1300));
+}
+
+function meWriteRow(tb, m, current_slug){
+  var tr=document.createElement('tr');
+  var pin = (m.slug===current_slug)?' <span class="status status-ingame">LIVE</span>':'';
+  tr.innerHTML =
+    '<td><code>'+m.slug+'</code>'+pin+'</td>'+
+    '<td>'+(m.filename||'')+'</td>'+
+    '<td>'+fmtKB(m.size_bytes)+'</td>'+
+    '<td>'+fmtTime(m.mtime)+'</td>'+
+    '<td><button class="btn" data-pin="'+m.slug+'">Pin as live</button></td>';
+  tb.appendChild(tr);
+  var btn=tr.querySelector('button');
+  btn.addEventListener('click',function(){mePinSlug(m.slug);});
+}
+
+function refreshCustomMaps(){
+  // Both panels share the same dropdown class names — keep in sync.
+  var pane=document.querySelector('#tab-mapeditor');
+  var tb=pane && pane.querySelector('.me-maps-table');
+  var status=pane && pane.querySelector('.me-status');
+  if(status){status.textContent='Loading…';status.style.color='';}
+  return api('GET','utenyaa','list_custom_maps').then(function(d){
+    customMapsCache=(d&&d.maps)||[];
+    var current=(d&&d.live_map_slug)||'';
+    var useLive=!!(d&&d.use_live_map);
+    // Repopulate ALL .me-live-map-slug + .utenyaa-live-map-slug selects.
+    document.querySelectorAll('.me-live-map-slug,.utenyaa-live-map-slug').forEach(function(sel){
+      var prev=sel.value;
+      sel.innerHTML='<option value="">(none)</option>';
+      customMapsCache.forEach(function(m){
+        var o=document.createElement('option');
+        o.value=m.slug;
+        o.textContent=m.slug+'  ('+fmtKB(m.size_bytes)+')';
+        sel.appendChild(o);
+      });
+      sel.value=current||prev||'';
+    });
+    document.querySelectorAll('.me-use-live-map,.utenyaa-use-live-map').forEach(function(cb){cb.checked=useLive;});
+    // ETA hint based on currently-selected map
+    document.querySelectorAll('.me-eta').forEach(function(span){
+      var m=customMapsCache.find(function(x){return x.slug===current;});
+      span.textContent = m ? meEtaSeconds(m.size_bytes)+' s ('+fmtKB(m.size_bytes)+')' : '8 s';
+    });
+    document.querySelectorAll('.me-live-map-info,.utenyaa-live-map-info').forEach(function(span){
+      var sel=span.parentElement.querySelector('select');
+      var m=customMapsCache.find(function(x){return x.slug===(sel&&sel.value);});
+      span.textContent = m ? '['+fmtKB(m.size_bytes)+', wire ~'+meEtaSeconds(m.size_bytes)+'s]' : '';
+      // Bind once: update the info span when the user picks a different map.
+      // We use a sentinel attribute to avoid double-binding on re-refresh.
+      if(sel && !sel.dataset.boundChange){
+        sel.dataset.boundChange='1';
+        sel.addEventListener('change',function(){
+          var m2=customMapsCache.find(function(x){return x.slug===sel.value;});
+          span.textContent = m2 ? '['+fmtKB(m2.size_bytes)+', wire ~'+meEtaSeconds(m2.size_bytes)+'s]' : '';
+        });
+      }
+    });
+    // Build the saved-maps table on the Map Editor tab.
+    if(tb){
+      tb.innerHTML='';
+      if(!customMapsCache.length){
+        tb.innerHTML='<tr><td colspan="5" class="muted">No saved maps yet — open the editor to author one.</td></tr>';
+      } else {
+        customMapsCache.forEach(function(m){meWriteRow(tb,m,current);});
+      }
+    }
+    if(status){status.textContent='Loaded '+customMapsCache.length+' map(s).';status.style.color='#2ecc71';}
+  }).catch(function(e){
+    if(status){status.textContent='Failed to list maps: '+(e.message||e);status.style.color='#d32f2f';}
+  });
+}
+
+function mePinSlug(slug){
+  // Helper: from the saved-maps table "Pin as live" button — sets
+  // the dropdown + use_live_map=true and applies in one shot.
+  document.querySelectorAll('.me-live-map-slug,.utenyaa-live-map-slug').forEach(function(s){s.value=slug;});
+  document.querySelectorAll('.me-use-live-map,.utenyaa-use-live-map').forEach(function(cb){cb.checked=true;});
+  meApplyLiveMap();
+}
+
+function meApplyLiveMap(){
+  // Read dropdown + checkbox from whichever panel was last touched
+  // — we POST both keys regardless so the two panels stay in lock-step.
+  var sel=document.querySelector('.me-live-map-slug,.utenyaa-live-map-slug');
+  var cb=document.querySelector('.me-use-live-map,.utenyaa-use-live-map');
+  var slug = sel ? sel.value : '';
+  var use  = cb ? !!cb.checked : false;
+  // Don't allow use=true with empty slug — UX guard.
+  if(use && !slug){
+    var s=document.querySelector('.me-apply-status,.utenyaa-livemap-status');
+    if(s){s.textContent='Pick a map first.';s.style.color='#d32f2f';}
+    return;
+  }
+  Promise.all([
+    api('POST','utenyaa','tune/live_map_slug',{value:slug}),
+    api('POST','utenyaa','tune/use_live_map',{value:use}),
+  ]).then(function(){
+    document.querySelectorAll('.me-apply-status,.utenyaa-livemap-status').forEach(function(s){
+      s.textContent='Applied at '+new Date().toLocaleTimeString()+
+                    (use?(' — next match will stream "'+slug+'".'):' — live map disabled.');
+      s.style.color='#2ecc71';
+    });
+    refreshCustomMaps();
+  }).catch(function(e){
+    document.querySelectorAll('.me-apply-status,.utenyaa-livemap-status').forEach(function(s){
+      s.textContent='Apply failed: '+(e.message||e); s.style.color='#d32f2f';
+    });
+  });
+}
+
+// Mirror — Utenyaa tab uses a slug-prefixed onclick to keep the per-tab
+// pattern consistent. Forwards to the shared handler.
+function utenyaaApplyLiveMap(slug){meApplyLiveMap();}
+
 function utenyaaLoadJoinHistory(slug){
   var pane=panel(slug);
   var tb=$('.utenyaa-jh-table',pane);
@@ -1048,7 +1286,8 @@ class AdminHandler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api" and parts[2] in (
                 "state", "history", "tuning", "tune",
-                "join_history", "leaderboard", "client_logs"):
+                "join_history", "leaderboard", "client_logs",
+                "list_custom_maps"):
             port = _port_for(parts[1])
             if not port:
                 self.send_error(404); return
