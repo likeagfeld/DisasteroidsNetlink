@@ -178,8 +178,11 @@ static void process_welcome(const uint8_t* payload, int len)
     g_net.last_recv_server_frame = 0;
     dnet_clear_all_snap_rings();
     if (!g_net.caps_sent) {
+        /* v1.1.3: announce ring + ring_v2 so the server sends us the
+         * fixed 13-byte SHIP_SYNC_Q_V2 (0xB3) with raw int16 rot
+         * instead of the broken 1-byte q_angle from v1. */
         int slen = dnet_encode_client_caps(g_net.tx_buf,
-                                            DNET_CAP_SUPPORTS_RING);
+            DNET_CAP_SUPPORTS_RING | DNET_CAP_RING_V2);
         net_transport_send(g_net.transport, g_net.tx_buf, slen);
         g_net.caps_sent = true;
     }
@@ -485,9 +488,48 @@ static void dnet_clear_all_snap_rings(void)
         dnet_clear_snap_ring((uint8_t)i);
 }
 
-/* Process SHIP_SYNC_Q: quantized server pose snapshot for a remote player.
- * Pushes the decoded pose into the per-pid ring; rendering happens later
- * inside dnet_apply_remote_snapshots(). */
+/* Common tail of process_ship_sync_quant / _v2: push a decoded snapshot
+ * into the per-pid ring. Caller has already filled all fields. Splitting
+ * this lets both opcode handlers share the ring-write logic verbatim. */
+static void push_snap_entry(uint8_t pid, uint16_t server_frame,
+                             int32_t x, int32_t y,
+                             int32_t dx, int32_t dy,
+                             int16_t rot, uint8_t flags)
+{
+    dnet_snap_ring_t* ring;
+    dnet_snap_entry_t* e;
+    int slot;
+
+    /* Track latest server frame for hit-report lag-comp. Use signed
+     * delta comparison so 16-bit wrap is handled correctly. */
+    {
+        int16_t delta = (int16_t)(server_frame - g_net.last_recv_server_frame);
+        if (delta > 0) g_net.last_recv_server_frame = server_frame;
+    }
+
+    ring = &g_net.snap_rings[pid];
+    slot = ring->head % DNET_SNAP_RING_SIZE;
+    e = &ring->entries[slot];
+    /* v1.1.2: key snapshots by Saturn's local 60 Hz frame counter so
+     * `target = frame_count - lag` advances every Saturn frame. */
+    e->frame = (uint16_t)g_net.frame_count;
+    e->x  = x;
+    e->y  = y;
+    e->dx = dx;
+    e->dy = dy;
+    e->rot = rot;
+    e->flags = flags;
+    e->valid = 1;
+
+    ring->head++;
+    if (ring->count < DNET_SNAP_RING_SIZE) ring->count++;
+}
+
+/* Process SHIP_SYNC_Q (v1, 0xB1): quantized server pose snapshot for a
+ * remote player. NOTE: the q_angle field here is the BROKEN v1
+ * encoding (rot>>8) that collapses plain-degree rot values 0..255 to 0.
+ * Kept for backward compatibility with v1.1.0-v1.1.2 servers; the v2
+ * handler (0xB3) below is the correct path for v1.1.3+ servers.       */
 static void process_ship_sync_quant(const uint8_t* payload, int len)
 {
     uint8_t pid;
@@ -495,9 +537,6 @@ static void process_ship_sync_quant(const uint8_t* payload, int len)
     int16_t x_q, y_q;
     int8_t  dx_q, dy_q;
     uint8_t angle_q, flags;
-    dnet_snap_ring_t* ring;
-    dnet_snap_entry_t* e;
-    int slot;
 
     /* [type:1][pid:1][server_frame:2][x_q:2][y_q:2][dx_q:1][dy_q:1][angle_q:1][flags:1] = 12 */
     if (len < 12) return;
@@ -515,32 +554,44 @@ static void process_ship_sync_quant(const uint8_t* payload, int len)
     angle_q = payload[10];
     flags = payload[11];
 
-    /* Track latest server frame for hit-report lag-comp. Use signed delta
-     * comparison so 16-bit wrap is handled correctly. */
-    {
-        int16_t delta = (int16_t)(server_frame - g_net.last_recv_server_frame);
-        if (delta > 0) g_net.last_recv_server_frame = server_frame;
-    }
+    push_snap_entry(pid, server_frame,
+                    dnet_d_pos(x_q), dnet_d_pos(y_q),
+                    dnet_d_vel(dx_q), dnet_d_vel(dy_q),
+                    dnet_d_angle(angle_q), flags);
+    return;
+}
 
-    ring = &g_net.snap_rings[pid];
-    slot = ring->head % DNET_SNAP_RING_SIZE;
-    e = &ring->entries[slot];
-    /* v1.1.2: key snapshots by Saturn's local 60 Hz frame counter, not by
-     * the server's 20 Hz tick stamp. This lets `target = frame_count -
-     * lag` advance every Saturn frame so bracket-pair interp produces a
-     * continuous curve. The server frame is still preserved separately
-     * in g_net.last_recv_server_frame for hit-report lag-comp.            */
-    e->frame = (uint16_t)g_net.frame_count;
-    e->x  = dnet_d_pos(x_q);
-    e->y  = dnet_d_pos(y_q);
-    e->dx = dnet_d_vel(dx_q);
-    e->dy = dnet_d_vel(dy_q);
-    e->rot = dnet_d_angle(angle_q);
-    e->flags = flags;
-    e->valid = 1;
+/* Process SHIP_SYNC_Q_V2 (0xB3): same as v1 but with raw int16 rot
+ * instead of the broken q_angle. Payload is 13 bytes total. */
+static void process_ship_sync_quant_v2(const uint8_t* payload, int len)
+{
+    uint8_t pid;
+    uint16_t server_frame;
+    int16_t x_q, y_q, rot;
+    int8_t  dx_q, dy_q;
+    uint8_t flags;
 
-    ring->head++;
-    if (ring->count < DNET_SNAP_RING_SIZE) ring->count++;
+    /* [type:1][pid:1][server_frame:2][x_q:2][y_q:2][dx_q:1][dy_q:1][rot:2 BE][flags:1] = 13 */
+    if (len < 13) return;
+
+    pid = payload[1];
+    if (pid >= DNET_MAX_PLAYERS) return;
+    if (pid == g_net.my_player_id) return;
+    if (g_Game.hasSecondLocal && pid == g_Game.myPlayerID2) return;
+
+    server_frame = ((uint16_t)payload[2] << 8) | (uint16_t)payload[3];
+    x_q   = (int16_t)(((uint16_t)payload[4] << 8) | (uint16_t)payload[5]);
+    y_q   = (int16_t)(((uint16_t)payload[6] << 8) | (uint16_t)payload[7]);
+    dx_q  = (int8_t)payload[8];
+    dy_q  = (int8_t)payload[9];
+    rot   = (int16_t)(((uint16_t)payload[10] << 8) | (uint16_t)payload[11]);
+    flags = payload[12];
+
+    push_snap_entry(pid, server_frame,
+                    dnet_d_pos(x_q), dnet_d_pos(y_q),
+                    dnet_d_vel(dx_q), dnet_d_vel(dy_q),
+                    rot, flags);
+    return;
 }
 
 /* Server toggled the global sync mode. Clear rings on EITHER transition
@@ -1093,6 +1144,10 @@ static void process_message(const uint8_t* payload, int len)
 
     case DNET_MSG_SHIP_SYNC_Q:
         process_ship_sync_quant(payload, len);
+        break;
+
+    case DNET_MSG_SHIP_SYNC_Q_V2:
+        process_ship_sync_quant_v2(payload, len);
         break;
 
     case DNET_MSG_SET_SYNC_MODE:

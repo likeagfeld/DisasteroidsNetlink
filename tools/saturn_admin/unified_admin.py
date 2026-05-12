@@ -305,6 +305,16 @@ def _render_admin_html() -> bytes:
         Asteroid drift correction
         <span class="muted">(only effective in RING mode — server tick catch-up + Saturn-matching wrap + periodic ASTEROID_SYNC)</span>
       </label>
+      <label>
+        Asteroid speed scale
+        <input type="number" step="0.1" min="0.25" max="2.0" class="sync-asteroid-speed-scale" style="width:70px">
+        <span class="muted">(1.0 = default, &lt;1.0 = slower asteroids, &gt;1.0 = faster — applies to new spawns)</span>
+      </label>
+      <label>
+        Ship collision radius bonus
+        <input type="number" step="1" min="-3" max="3" class="sync-ship-radius-bonus" style="width:70px">
+        <span class="muted">(0 = default, negative = stricter server-side ship-vs-asteroid hits — reduces ghost-kills)</span>
+      </label>
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn" onclick="applySyncMode('{slug}')">Apply</button>
@@ -722,15 +732,22 @@ function wireSyncInputs(slug){
       if(b)b.textContent=(b.textContent.replace(/ \\(pending.*$/,''))+' (pending — click Apply)';
     });
   });
-  // Asteroid drift correction sub-toggle. Marks the panel dirty exactly
-  // like the radios so the next refresh tick won't stomp the user's edit.
-  var ac=$('.sync-asteroid-correct',sp);
-  if(ac){
-    ac.addEventListener('change',function(){syncDirty[slug]=true;
+  // Asteroid drift correction + speed scale + ship radius bonus.
+  // All three mark the panel dirty so the next refresh won't stomp the
+  // user's edit. They live in the same panel because they're the three
+  // server-side game-feel knobs added in v1.1.3.
+  ['.sync-asteroid-correct',
+   '.sync-asteroid-speed-scale',
+   '.sync-ship-radius-bonus'].forEach(function(sel){
+    var el=$(sel,sp);
+    if(!el)return;
+    var mark=function(){syncDirty[slug]=true;
       var b=$('.sync-badge',sp);
       if(b)b.textContent=(b.textContent.replace(/ \\(pending.*$/,''))+' (pending — click Apply)';
-    });
-  }
+    };
+    el.addEventListener('change',mark);
+    el.addEventListener('input',mark);
+  });
 }
 function renderSyncMode(slug,d){
   var sp=$('.sync-panel',panel(slug));
@@ -743,12 +760,19 @@ function renderSyncMode(slug,d){
     });
     var ac=$('.sync-asteroid-correct',sp);
     if(ac){
-      // Default to true (server default) when the field is missing, so a
-      // fresh server doesn't show the box unchecked just because of a
-      // /api/tuning round-trip.
       var v=d.tuning.asteroid_sync_correct;
       ac.checked = (v===undefined) ? true : !!v;
       ac.disabled = (mode!=='RING');
+    }
+    var ass=$('.sync-asteroid-speed-scale',sp);
+    if(ass){
+      var sv=d.tuning.asteroid_speed_scale;
+      ass.value = (sv===undefined) ? 1.0 : sv;
+    }
+    var srb=$('.sync-ship-radius-bonus',sp);
+    if(srb){
+      var bv=d.tuning.ship_collision_radius_bonus;
+      srb.value = (bv===undefined) ? 0 : bv;
     }
   }
   var badge=$('.sync-badge',sp);
@@ -766,9 +790,21 @@ function applySyncMode(slug){
   var body={sync_mode:mode};
   var ac=$('.sync-asteroid-correct',sp);
   if(ac) body.asteroid_sync_correct = !!ac.checked;
+  var ass=$('.sync-asteroid-speed-scale',sp);
+  if(ass && ass.value!=='' && !isNaN(parseFloat(ass.value))){
+    var sv=parseFloat(ass.value);
+    if(sv<0.25)sv=0.25; if(sv>2.0)sv=2.0;
+    body.asteroid_speed_scale = sv;
+  }
+  var srb=$('.sync-ship-radius-bonus',sp);
+  if(srb && srb.value!=='' && !isNaN(parseInt(srb.value,10))){
+    var bv=parseInt(srb.value,10);
+    if(bv<-3)bv=-3; if(bv>3)bv=3;
+    body.ship_collision_radius_bonus = bv;
+  }
   api('POST',slug,'tuning',body).then(function(r){
     if(r.error){showMsg('Sync error: '+r.error,'#d32f2f');return;}
-    showMsg('Sync settings applied ('+mode+(ac?(', asteroid_correct='+(ac.checked?'on':'off')):'')+')');
+    showMsg('Sync settings applied');
     syncDirty[slug]=false;
     refreshTuning(slug);
   }).catch(function(e){showMsg('Sync apply failed: '+e.message,'#d32f2f');});

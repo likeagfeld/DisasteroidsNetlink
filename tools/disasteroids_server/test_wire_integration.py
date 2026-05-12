@@ -214,8 +214,10 @@ def main():
                    new.username.encode())
     time.sleep(0.4)
 
-    # New client announces ring capability (old client never does).
-    new.send_frame(bytes([D.DNET_MSG_CLIENT_CAPS, D.CAP_SUPPORTS_RING]))
+    # New client announces ring + ring_v2 (v1.1.3+ binary).
+    # OLD client never sends CAPS.
+    new.send_frame(bytes([D.DNET_MSG_CLIENT_CAPS,
+                          D.CAP_SUPPORTS_RING | D.CAP_RING_V2]))
     time.sleep(0.4)
 
     # Verify: NEW received SET_SYNC_MODE (0xB0) with RING (1).
@@ -261,18 +263,36 @@ def main():
     old.clear()
     new.clear()
 
-    # OLD sends a SHIP_STATE; this should be relayed to NEW.
+    # OLD sends a SHIP_STATE with rot=1234 so we can verify the v2
+    # relay preserves the rotation exactly (v1's q_angle would have
+    # collapsed any rot in [0..255] to 0).
     old.send_frame(encode_ship_state_ext(
-        old_pid, 1000 << 16, 2000 << 16, 100, 200, 0, 0x01))
+        old_pid, 1000 << 16, 2000 << 16, 100, 200, 1234, 0x01))
     time.sleep(0.5)
 
-    # NEW should have received SHIP_SYNC_Q (0xB1), NOT raw SHIP_SYNC (0xA9).
-    new_q = new.msgs_of_type(D.DNET_MSG_SHIP_SYNC_Q)
+    # NEW (ring_v2-capable) should have received SHIP_SYNC_Q_V2 (0xB3),
+    # NOT SHIP_SYNC_Q (0xB1) and NOT raw SHIP_SYNC (0xA9).
+    new_q  = new.msgs_of_type(D.DNET_MSG_SHIP_SYNC_Q)
+    new_q2 = new.msgs_of_type(D.DNET_MSG_SHIP_SYNC_Q_V2)
     new_raw = new.msgs_of_type(D.DNET_MSG_SHIP_SYNC)
-    assert new_q, "NEW client expected SHIP_SYNC_Q (0xB1) under RING+caps"
+    assert new_q2, "NEW client expected SHIP_SYNC_Q_V2 (0xB3) under RING+v2 caps"
+    assert not new_q, \
+        "NEW client got legacy 0xB1 instead of 0xB3 (caps dispatch broken)"
     assert not new_raw, \
-        "NEW client got raw 0xA9 under RING (should be quantized)"
-    print("  NEW client received SHIP_SYNC_Q: PASS (%d msgs)" % len(new_q))
+        "NEW client got raw 0xA9 under RING (should be quantized v2)"
+    # Verify the v2 payload preserves rot exactly: server's rot value
+    # was 1234 in our SHIP_STATE; bytes [11..12] of the relayed
+    # SHIP_SYNC_Q_V2 payload should be 0x04 0xD2.
+    sample = new_q2[0]
+    # payload layout (offset from payload[0] = type which IS the message
+    # type at the dispatcher level — our `payload` slice starts AFTER
+    # the type byte, so adjust): we receive (msg_type, payload[1:])
+    # actually FakeClient strips the type so payload[0]=pid here.
+    # payload: [pid:1][server_frame:2][x_q:2][y_q:2][dx_q:1][dy_q:1][rot:2 BE][flags:1]
+    # rot is at offset 9..10.
+    decoded_rot = struct.unpack("!h", sample[9:11])[0]
+    assert decoded_rot == 1234, "v2 relay corrupted rot: got %d" % decoded_rot
+    print("  NEW client received SHIP_SYNC_Q_V2 with exact rot=1234: PASS (%d msgs)" % len(new_q2))
 
     # NEW sends a SHIP_STATE; this should be relayed to OLD as raw.
     new.clear()

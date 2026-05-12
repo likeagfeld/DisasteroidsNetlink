@@ -93,14 +93,30 @@
  *   q_angle = u16 angle >> 8  (256 levels = 1.4° precision)
  */
 #define DNET_MSG_SET_SYNC_MODE     0xB0  /* [mode:1] (0=LERP, 1=RING) */
-#define DNET_MSG_SHIP_SYNC_Q       0xB1  /* quantized SHIP_SYNC (see above) */
-#define DNET_MSG_ASTEROID_SYNC     0xB2  /* periodic asteroid pos correction
-                                           [count:1]{slot:1,x:4,y:4,dx:4,dy:4}xN
-                                           Sent only to ring-capable clients
-                                           when sync_mode==RING and the
-                                           tuning.asteroid_sync_correct knob
-                                           is on. Old clients ignore via
-                                           default-case dispatcher. */
+#define DNET_MSG_SHIP_SYNC_Q       0xB1  /* quantized SHIP_SYNC v1 (12-byte
+                                           payload, q_angle 1-byte rot).
+                                           NOTE: v1's q_angle = rot>>8 was
+                                           designed for SGL 16-bit modular
+                                           angles, but Disasteroids stores
+                                           rot as plain integer degrees
+                                           (0..359 via objects/ship.c:179),
+                                           so q_angle collapsed all values
+                                           0..255° to 0. Replaced by 0xB3
+                                           in v1.1.3 — kept here only for
+                                           backward compatibility with
+                                           v1.1.0-v1.1.2 clients. */
+#define DNET_MSG_ASTEROID_SYNC     0xB2  /* periodic asteroid pos correction */
+#define DNET_MSG_SHIP_SYNC_Q_V2    0xB3  /* quantized SHIP_SYNC v2 (13-byte
+                                           payload, raw int16 rot — fixes
+                                           the v1 quantization bug for
+                                           plain-degree rot). Wire layout:
+                                           [type:1][pid:1][server_frame:2 BE]
+                                           [x_q:i16 BE][y_q:i16 BE]
+                                           [dx_q:i8][dy_q:i8]
+                                           [rot:i16 BE][flags:1]
+                                           Sent only to clients that
+                                           announce DNET_CAP_RING_V2 in
+                                           their CLIENT_CAPS payload. */
 
 /* Sync mode constants (match server-side string mapping in dserver.py). */
 #define DNET_SYNC_MODE_LERP        0
@@ -108,6 +124,11 @@
 
 /* Client capability flag bits (sent in DNET_MSG_CLIENT_CAPS). */
 #define DNET_CAP_SUPPORTS_RING     0x01
+#define DNET_CAP_RING_V2           0x02  /* v1.1.3: client understands the
+                                            13-byte SHIP_SYNC_Q_V2 (0xB3)
+                                            with raw int16 rot. Old binaries
+                                            only set bit 0; servers send
+                                            them legacy 0xB1 packets. */
 
 /* Quantization shift amounts. MUST match server-side q_pos/q_vel/q_angle. */
 #define DNET_QPOS_SHIFT            9

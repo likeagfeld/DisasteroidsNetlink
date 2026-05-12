@@ -107,8 +107,11 @@ DNET_MSG_PLAYER_SPAWN = 0xAE
 DNET_MSG_LOCAL_PLAYER_ACK = 0x86
 DNET_MSG_LEADERBOARD_DATA = 0xAF
 DNET_MSG_SET_SYNC_MODE = 0xB0  # [mode:1] (0=LERP, 1=RING)
-DNET_MSG_SHIP_SYNC_Q = 0xB1    # quantized SHIP_SYNC (12-byte payload)
+DNET_MSG_SHIP_SYNC_Q = 0xB1    # quantized SHIP_SYNC v1 (12-byte payload,
+                               # 1-byte q_angle — broken for plain-degree rot)
 DNET_MSG_ASTEROID_SYNC = 0xB2  # periodic asteroid position correction
+DNET_MSG_SHIP_SYNC_Q_V2 = 0xB3 # quantized SHIP_SYNC v2 (13-byte payload,
+                               # int16 raw rot — fixes v1 quantization bug)
 
 # Sync-mode wire constants. MUST match Saturn-side DNET_SYNC_MODE_* in
 # disasteroids_protocol.h. Stored as strings in self.tuning for human-friendly
@@ -117,6 +120,7 @@ SYNC_MODE_BYTE = {"LERP": 0, "RING": 1}
 
 # Capability flag bits sent in CLIENT_CAPS payload.
 CAP_SUPPORTS_RING = 0x01
+CAP_RING_V2       = 0x02   # v1.1.3 — client wants the 13-byte 0xB3 form
 
 # Quantization shift amounts. MUST match Saturn-side DNET_QPOS_SHIFT etc.
 QPOS_SHIFT = 9       # 1/128 unit precision, ±256 unit range
@@ -338,7 +342,9 @@ def q_angle(rot: int) -> int:
 def build_ship_sync_quant(player_id: int, server_frame: int,
                           x: int, y: int, dx: int, dy: int,
                           rot: int, flags: int) -> bytes:
-    """Quantized SHIP_SYNC for RING-capable clients. 12-byte payload total.
+    """Quantized SHIP_SYNC v1 for RING-capable clients (legacy, v1.1.0-v1.1.2).
+    12-byte payload — but q_angle is BROKEN for plain-degree rot. Kept for
+    backward compat with clients that don't announce CAP_RING_V2.
 
     Wire: [type:1][pid:1][server_frame:2 BE][x_q:i16 BE][y_q:i16 BE]
           [dx_q:i8][dy_q:i8][angle_q:u8][flags:1]
@@ -348,6 +354,28 @@ def build_ship_sync_quant(player_id: int, server_frame: int,
     payload += struct.pack("!hh", q_pos(x), q_pos(y))
     payload += struct.pack("!bb", q_vel(dx), q_vel(dy))
     payload += struct.pack("!BB", q_angle(rot), flags & 0xFF)
+    return encode_frame(payload)
+
+
+def build_ship_sync_quant_v2(player_id: int, server_frame: int,
+                              x: int, y: int, dx: int, dy: int,
+                              rot: int, flags: int) -> bytes:
+    """Quantized SHIP_SYNC v2 for clients announcing CAP_RING_V2.
+    13-byte payload — sends raw int16 rot instead of the broken q_angle
+    (rot in Disasteroids is plain integer degrees 0..359, so q_angle's
+    `(rot & 0xFFFF) >> 8` collapsed 71% of the circle to 0°).
+
+    Wire: [type:1][pid:1][server_frame:2 BE][x_q:i16 BE][y_q:i16 BE]
+          [dx_q:i8][dy_q:i8][rot:i16 BE][flags:1]
+    """
+    payload = bytes([DNET_MSG_SHIP_SYNC_Q_V2, player_id & 0xFF])
+    payload += struct.pack("!H", server_frame & 0xFFFF)
+    payload += struct.pack("!hh", q_pos(x), q_pos(y))
+    payload += struct.pack("!bb", q_vel(dx), q_vel(dy))
+    # Clamp rot to int16 range (it should already be 0..359 from Saturn,
+    # but defend against any out-of-range values reaching the encoder).
+    rot_i16 = max(-32768, min(32767, int(rot)))
+    payload += struct.pack("!hB", rot_i16, flags & 0xFF)
     return encode_frame(payload)
 
 
@@ -479,6 +507,26 @@ def _asteroid_sync_selftest():
             "entry %d field mismatch" % i
         off += 17
 
+    # 2b. build_ship_sync_quant_v2 round-trip (v1.1.3): the new 13-byte
+    # form replaces broken q_angle with raw int16 rot. Verify exact
+    # preservation of rot values that the v1 form silently destroyed
+    # (rot ∈ [0..255] all collapsed to 0° under v1's q_angle = rot>>8).
+    test_rots = [0, 1, 7, 14, 90, 91, 180, 255, 256, 359, -180, 32767]
+    for r in test_rots:
+        frame = build_ship_sync_quant_v2(5, 0x1234, 0, 0, 0, 0, r, 0)
+        # Frame layout: [LEN_HI][LEN_LO][TYPE=0xB3][pid][server_frame:2]
+        # [x_q:2][y_q:2][dx_q:1][dy_q:1][rot:2 BE][flags:1] = 13 payload
+        payload_len = (frame[0] << 8) | frame[1]
+        assert payload_len == 13, "v2 length wrong: %d" % payload_len
+        assert frame[2] == DNET_MSG_SHIP_SYNC_Q_V2, "v2 type wrong"
+        # frame[0..1]=SNCP, frame[2]=type, frame[3]=pid, frame[4..5]=server_frame,
+        # frame[6..7]=x_q, frame[8..9]=y_q, frame[10]=dx_q, frame[11]=dy_q,
+        # frame[12..13]=rot BE, frame[14]=flags
+        decoded_rot = struct.unpack("!h", frame[12:14])[0]
+        expected = max(-32768, min(32767, r))
+        assert decoded_rot == expected, \
+            "v2 rot round-trip failed: in=%d out=%d" % (r, decoded_rot)
+
     # 3. Tick catch-up arithmetic. Given a wall-clock interval and a tick
     # interval, the loop should run floor(elapsed / tick_interval) ticks.
     interval = 0.05  # 20 Hz
@@ -573,6 +621,17 @@ def _circle_collision(x1: int, y1: int, r1: int,
     dy = y2 - y1
     dr = r1 + r2
     return (dx * dx + dy * dy) < (dr * dr)
+
+
+# Input bit layout (DNET_INPUT_*) — used by bot AI.
+INPUT_UP, INPUT_DOWN, INPUT_LEFT, INPUT_RIGHT = 1, 2, 4, 8
+INPUT_A, INPUT_B, INPUT_C = 16, 32, 64
+
+# NOTE: Server-side input prediction was attempted for v1.1.3 but DEFERRED.
+# After tracing the actual code (rot is plain integer degrees, not SGL
+# 16-bit modular), the planned prediction needs more rigorous physics
+# parity testing against a Saturn-instrumented build before it can ship
+# safely. See project memory.
 
 
 def _wrap_coord(val: int, lo: int, hi: int) -> int:
@@ -685,7 +744,7 @@ class GameSimulation:
                     break
         return best
 
-    def start_wave(self) -> tuple:
+    def start_wave(self, speed_scale: float = 1.0) -> tuple:
         """Generate a new wave of asteroids.
         Returns (wave_num, asteroid_data_list, player_spawn_list)."""
         self.wave += 1
@@ -706,7 +765,7 @@ class GameSimulation:
 
         asteroid_data = []
         for i in range(count):
-            a = self._randomize_asteroid(speed_increment)
+            a = self._randomize_asteroid(speed_increment, speed_scale)
             self.asteroids[i] = a
             asteroid_data.append((a["x"], a["y"], a["dx"], a["dy"],
                                   a["size"], a["type"]))
@@ -730,7 +789,8 @@ class GameSimulation:
 
         return (self.wave, asteroid_data, player_spawns)
 
-    def _randomize_asteroid(self, speed_increment: int) -> dict:
+    def _randomize_asteroid(self, speed_increment: int,
+                             speed_scale: float = 1.0) -> dict:
         """Generate random asteroid data matching randomizeDisasteroid()."""
         angle = random.randint(1, 360)
 
@@ -774,6 +834,15 @@ class GameSimulation:
         elif dy < 0 and dy > -quarter:
             dy -= quarter
 
+        # v1.1.3 — apply admin-tunable speed scale AFTER the minimum-speed
+        # floor and direction-wise increment, so a scale of 0.5 still
+        # gives every asteroid some motion (we don't end up with stuck
+        # asteroids from rounding to zero). Clamped to a sane range by
+        # the validator (0.25..2.0).
+        if speed_scale != 1.0:
+            dx = int(dx * speed_scale)
+            dy = int(dy * speed_scale)
+
         size = random.randint(0, DISASTEROID_SIZE_MAX - 1)
         atype = random.randint(0, NUM_DISASTEROID_VARIATIONS - 1)
 
@@ -782,7 +851,9 @@ class GameSimulation:
             "size": size, "type": atype, "alive": True,
         }
 
-    def tick(self, wrap_saturn: bool = False) -> list:
+    def tick(self, wrap_saturn: bool = False,
+              speed_scale: float = 1.0,
+              ship_radius_bonus: int = 0) -> list:
         """Run one server tick (~50ms). Returns list of events to broadcast.
 
         Runs TICK_RATIO sub-steps per tick (one per Saturn frame) so that
@@ -853,11 +924,18 @@ class GameSimulation:
                     ax = int(_from_fixed(a["x"]))
                     ay = int(_from_fixed(a["y"]))
                     ar = _disasteroid_radius(a["size"]) + 2
-                    if _circle_collision(ax, ay, ar, px, py, PLAYER_SHIP_RADIUS):
+                    # v1.1.3: ship-vs-asteroid radius is admin-tunable.
+                    # Negative bonus shrinks the kill zone, reducing
+                    # ghost-kills from stale server-side player positions.
+                    ship_r = PLAYER_SHIP_RADIUS + ship_radius_bonus
+                    if ship_r < 1:
+                        ship_r = 1
+                    if _circle_collision(ax, ay, ar, px, py, ship_r):
                         kill_evt = self._kill_player(pid, i)
                         if kill_evt:
                             events.append(kill_evt)
-                        destroy_evt = self._destroy_asteroid(i, 0xFF)
+                        destroy_evt = self._destroy_asteroid(i, 0xFF,
+                                                              speed_scale)
                         if destroy_evt:
                             events.append(destroy_evt)
                         killed_this_tick.add(pid)
@@ -877,19 +955,21 @@ class GameSimulation:
 
         return events
 
-    def handle_asteroid_hit(self, slot: int, scorer_id: int):
+    def handle_asteroid_hit(self, slot: int, scorer_id: int,
+                              speed_scale: float = 1.0):
         """Handle ASTEROID_HIT from a client. Returns destroy event or None."""
         if slot < 0 or slot >= MAX_DISASTEROIDS:
             return None
         a = self.asteroids[slot]
         if a is None or not a["alive"]:
             return None
-        result = self._destroy_asteroid(slot, scorer_id)
+        result = self._destroy_asteroid(slot, scorer_id, speed_scale)
         if result is not None and scorer_id != 0xFF and scorer_id < MAX_PLAYERS:
             self.scores[scorer_id] = self.scores.get(scorer_id, 0) + 1
         return result
 
-    def _destroy_asteroid(self, slot: int, scorer_id: int):
+    def _destroy_asteroid(self, slot: int, scorer_id: int,
+                           speed_scale: float = 1.0):
         """Destroy asteroid, generate split data. Returns event tuple."""
         a = self.asteroids[slot]
         if a is None or not a["alive"]:
@@ -902,7 +982,8 @@ class GameSimulation:
                 child_slot = self._find_free_slot()
                 if child_slot < 0:
                     break
-                child = self._randomize_asteroid(0x100 * self.wave)
+                child = self._randomize_asteroid(0x100 * self.wave,
+                                                  speed_scale)
                 child["x"] = a["x"]
                 child["y"] = a["y"]
                 child["size"] = a["size"] - 1
@@ -1196,6 +1277,10 @@ class ClientInfo:
         # send CLIENT_CAPS, so we default to "no advanced caps" — they
         # always receive raw 22-byte SHIP_SYNC and ignore SET_SYNC_MODE.
         self.supports_ring = False
+        # v1.1.3: client supports the fixed 13-byte SHIP_SYNC_Q_V2 (0xB3)
+        # with raw int16 rot. Clients announcing only CAP_SUPPORTS_RING
+        # (pre-1.1.3) get the legacy 12-byte 0xB1 form.
+        self.supports_ring_v2 = False
         # Last sync mode this client was told about. None = never told.
         # Lets us avoid spamming SET_SYNC_MODE on every tick.
         self.last_sent_sync_mode = None
@@ -1297,6 +1382,21 @@ class DisasteroidsServer:
             # (c) periodic ASTEROID_SYNC broadcasts. When False, server runs
             # the v1.1.0 LERP-style asteroid path even if sync_mode==RING.
             "asteroid_sync_correct": True,
+            # v1.1.3 — server-side ship-vs-asteroid leniency. Server adds
+            # this to PLAYER_SHIP_RADIUS (5) when checking collisions in
+            # tick(). Negative = stricter (server requires more overlap
+            # before killing), reducing "ghost kills" caused by the
+            # server's stale 4-frame-old player position. Positive =
+            # more aggressive (kills on near-misses). Range -3..+3
+            # enforced by validator. Default 0 = pre-1.1.3 behavior.
+            "ship_collision_radius_bonus": 0,
+            # v1.1.3 — game-feel: scale all new asteroid spawn velocities
+            # by this factor. 1.0 = original speed; 0.5 = half-speed asteroids
+            # (gentler, more time to react); 1.5 = harder. Only affects
+            # asteroids spawned AFTER the toggle change — in-flight asteroids
+            # keep their original velocity. Range 0.25..2.0 enforced by
+            # validator.
+            "asteroid_speed_scale": 1.0,
         }
         self._tuning_presets = {
             "PASSTHROUGH": {
@@ -2068,8 +2168,10 @@ class DisasteroidsServer:
             return
         caps = payload[1]
         client.supports_ring = bool(caps & CAP_SUPPORTS_RING)
-        log.info("Client %s caps: 0x%02X (ring=%s)",
-                 client.username or "?", caps, client.supports_ring)
+        client.supports_ring_v2 = bool(caps & CAP_RING_V2)
+        log.info("Client %s caps: 0x%02X (ring=%s ring_v2=%s)",
+                 client.username or "?", caps,
+                 client.supports_ring, client.supports_ring_v2)
         # Tell the client which engine to run. Always send so the client
         # knows even if the global default has changed since it connected.
         self._send_sync_mode_to(client, force=True)
@@ -2153,19 +2255,18 @@ class DisasteroidsServer:
                 should_relay = False
 
         if should_relay:
-            # Two recipient classes:
-            #   - LERP recipients (old clients OR global mode == LERP): get
-            #     the raw 22-byte SHIP_SYNC byte-for-byte identical to the
-            #     pre-1.1.0 server. Pure relay of the firer's bytes.
-            #   - RING recipients (ring-capable + global mode == RING): get
-            #     the 14-byte quantized SHIP_SYNC_Q stamped with the
-            #     server's current tick as `server_frame`.
+            # Three recipient classes:
+            #   - LERP / non-ring (old clients OR global mode == LERP):
+            #     raw 22-byte SHIP_SYNC byte-for-byte identical to pre-1.1.0.
+            #   - RING v1 (ring-capable but pre-1.1.3 client): legacy
+            #     12-byte SHIP_SYNC_Q. Still has the q_angle rot bug,
+            #     but we can't fix that without a new binary.
+            #   - RING v2 (v1.1.3+ ring-capable client): 13-byte
+            #     SHIP_SYNC_Q_V2 with raw int16 rot — correct rotation.
             global_mode = self.tuning.get("sync_mode", "LERP")
             raw_msg = build_ship_sync_raw(player_id, raw_data)
-            quant_msg = None
-            # rot is at offset 18..19 of the 20-byte raw_data when the
-            # client sent the 21-byte (extended) form; the helper's
-            # `raw_data` slice always starts at the x field.
+            quant_v1_msg = None
+            quant_v2_msg = None
             try:
                 rot_val = struct.unpack("!h", raw_data[16:18])[0]
             except struct.error:
@@ -2174,11 +2275,18 @@ class DisasteroidsServer:
                 if not c.in_game or s == sock:
                     continue
                 if global_mode == "RING" and c.supports_ring:
-                    if quant_msg is None:
-                        quant_msg = build_ship_sync_quant(
-                            player_id, self._tick_counter,
-                            x, y, dx, dy, rot_val, flags)
-                    c.send_raw(quant_msg)
+                    if c.supports_ring_v2:
+                        if quant_v2_msg is None:
+                            quant_v2_msg = build_ship_sync_quant_v2(
+                                player_id, self._tick_counter,
+                                x, y, dx, dy, rot_val, flags)
+                        c.send_raw(quant_v2_msg)
+                    else:
+                        if quant_v1_msg is None:
+                            quant_v1_msg = build_ship_sync_quant(
+                                player_id, self._tick_counter,
+                                x, y, dx, dy, rot_val, flags)
+                        c.send_raw(quant_v1_msg)
                 else:
                     c.send_raw(raw_msg)
             client.last_ship_sync_relay_tick = self._tick_counter
@@ -2192,7 +2300,8 @@ class DisasteroidsServer:
         slot = payload[1]
         scorer_id = payload[2]
 
-        evt = self.sim.handle_asteroid_hit(slot, scorer_id)
+        speed_scale = float(self.tuning.get("asteroid_speed_scale", 1.0))
+        evt = self.sim.handle_asteroid_hit(slot, scorer_id, speed_scale)
         if evt:
             self._broadcast_event(evt)
 
@@ -2262,7 +2371,8 @@ class DisasteroidsServer:
 
         # Destroy the asteroid (if still alive); slot 0xFF = projectile kill, no asteroid
         if slot != 0xFF:
-            destroy_evt = self.sim._destroy_asteroid(slot, 0xFF)
+            speed_scale = float(self.tuning.get("asteroid_speed_scale", 1.0))
+            destroy_evt = self.sim._destroy_asteroid(slot, 0xFF, speed_scale)
             if destroy_evt:
                 self._broadcast_event(destroy_evt)
 
@@ -2290,7 +2400,12 @@ class DisasteroidsServer:
         wrap_saturn = (
             self.tuning.get("sync_mode", "LERP") == "RING" and
             self.tuning.get("asteroid_sync_correct", True))
-        events = self.sim.tick(wrap_saturn=wrap_saturn)
+        speed_scale = float(self.tuning.get("asteroid_speed_scale", 1.0))
+        ship_radius_bonus = int(
+            self.tuning.get("ship_collision_radius_bonus", 0))
+        events = self.sim.tick(wrap_saturn=wrap_saturn,
+                                speed_scale=speed_scale,
+                                ship_radius_bonus=ship_radius_bonus)
         for evt in events:
             if evt[0] == "wave_over":
                 self._start_new_wave()
@@ -2358,24 +2473,33 @@ class DisasteroidsServer:
             bot.sync_tick_counter += 1
             bot_sync_every_n = max(1, int(self.tuning["bot_sync_every_n_ticks"]))
             if (bot.sync_tick_counter % bot_sync_every_n) == 0:
-                # Same per-recipient dispatch as human SHIP_SYNC relay:
-                # RING-capable clients on the global RING engine get the
-                # quantized form; everyone else gets the raw 22-byte form.
+                # Same three-way dispatch as human SHIP_SYNC relay:
+                # raw (LERP / no-caps), quant v1 (legacy ring), quant v2
+                # (v1.1.3+ ring with fixed int16 rot).
                 global_mode = self.tuning.get("sync_mode", "LERP")
                 raw_sync = build_ship_sync(
                     bot.game_player_id, bot.x, bot.y,
                     bot.dx, bot.dy, bot.rot & 0x7FFF, flags)
-                quant_sync = None
+                quant_v1 = None
+                quant_v2 = None
                 for s, c in self.clients.items():
                     if not c.in_game:
                         continue
                     if global_mode == "RING" and c.supports_ring:
-                        if quant_sync is None:
-                            quant_sync = build_ship_sync_quant(
-                                bot.game_player_id, self._tick_counter,
-                                bot.x, bot.y, bot.dx, bot.dy,
-                                bot.rot & 0x7FFF, flags)
-                        c.send_raw(quant_sync)
+                        if c.supports_ring_v2:
+                            if quant_v2 is None:
+                                quant_v2 = build_ship_sync_quant_v2(
+                                    bot.game_player_id, self._tick_counter,
+                                    bot.x, bot.y, bot.dx, bot.dy,
+                                    bot.rot & 0x7FFF, flags)
+                            c.send_raw(quant_v2)
+                        else:
+                            if quant_v1 is None:
+                                quant_v1 = build_ship_sync_quant(
+                                    bot.game_player_id, self._tick_counter,
+                                    bot.x, bot.y, bot.dx, bot.dy,
+                                    bot.rot & 0x7FFF, flags)
+                            c.send_raw(quant_v1)
                     else:
                         c.send_raw(raw_sync)
 
@@ -2384,7 +2508,9 @@ class DisasteroidsServer:
         if not self.sim:
             return
 
-        wave, asteroid_data, player_spawns = self.sim.start_wave()
+        speed_scale = float(self.tuning.get("asteroid_speed_scale", 1.0))
+        wave, asteroid_data, player_spawns = self.sim.start_wave(
+            speed_scale=speed_scale)
 
         # Broadcast WAVE_EVENT
         wave_msg = build_wave_event(wave, asteroid_data,
@@ -2717,7 +2843,11 @@ class DisasteroidsServer:
         # the rest of the logic only sees true bandwidth knobs.
         sync_mode_change = data.get("sync_mode")
         asteroid_correct_change = data.get("asteroid_sync_correct")
-        ORTHOGONAL = {"preset", "sync_mode", "asteroid_sync_correct"}
+        asteroid_speed_scale_change = data.get("asteroid_speed_scale")
+        ship_radius_bonus_change = data.get("ship_collision_radius_bonus")
+        ORTHOGONAL = {"preset", "sync_mode",
+                       "asteroid_sync_correct", "asteroid_speed_scale",
+                       "ship_collision_radius_bonus"}
         bandwidth_keys = [k for k in data.keys() if k not in ORTHOGONAL]
 
         if preset == "AUTO":
@@ -2741,6 +2871,16 @@ class DisasteroidsServer:
                     bool(asteroid_correct_change)
                 log.info("Tuning: asteroid_sync_correct=%s",
                          asteroid_correct_change)
+            if asteroid_speed_scale_change is not None:
+                self.tuning["asteroid_speed_scale"] = float(
+                    asteroid_speed_scale_change)
+                log.info("Tuning: asteroid_speed_scale=%.2f",
+                         float(asteroid_speed_scale_change))
+            if ship_radius_bonus_change is not None:
+                self.tuning["ship_collision_radius_bonus"] = int(
+                    ship_radius_bonus_change)
+                log.info("Tuning: ship_collision_radius_bonus=%d",
+                         int(ship_radius_bonus_change))
             return
 
         if preset and preset != "CUSTOM":
@@ -2772,6 +2912,24 @@ class DisasteroidsServer:
             self.tuning["asteroid_sync_correct"] = bool(asteroid_correct_change)
             log.info("Tuning: asteroid_sync_correct=%s",
                      asteroid_correct_change)
+
+        if asteroid_speed_scale_change is not None:
+            # Pure server-side knob — takes effect on the next asteroid
+            # spawn (existing in-flight asteroids keep their velocity).
+            self.tuning["asteroid_speed_scale"] = float(
+                asteroid_speed_scale_change)
+            log.info("Tuning: asteroid_speed_scale=%.2f",
+                     float(asteroid_speed_scale_change))
+
+        if ship_radius_bonus_change is not None:
+            # Pure server-side knob — takes effect on the next tick.
+            # Negative = stricter ship-asteroid collision detection;
+            # used to reduce ghost-kills from server-side stale player
+            # position dead-reckoning.
+            self.tuning["ship_collision_radius_bonus"] = int(
+                ship_radius_bonus_change)
+            log.info("Tuning: ship_collision_radius_bonus=%d",
+                     int(ship_radius_bonus_change))
 
     def _apply_tuning_preset(self, preset_name: str,
                              from_auto: bool = False) -> bool:
@@ -2965,10 +3123,16 @@ _TUNING_INT_RANGES = {
     "stationary_vel_threshold":  (0, 50),
     "ship_sync_keepalive_ticks": (15, 120),
     "bot_sync_every_n_ticks":    (1, 4),
+    "ship_collision_radius_bonus": (-3, 3),
 }
 _TUNING_BOOL_KEYS = {"ship_sync_skip_stationary", "asteroid_sync_correct"}
 _TUNING_STR_ENUMS = {
     "sync_mode": ("LERP", "RING"),
+}
+# Float-valued tunables with [lo, hi] inclusive range. Accept int or float
+# in the JSON payload; validator coerces to float.
+_TUNING_FLOAT_RANGES = {
+    "asteroid_speed_scale": (0.25, 2.0),
 }
 
 
@@ -2997,6 +3161,14 @@ def _validate_tuning_update(data, presets):
             allowed = _TUNING_STR_ENUMS[key]
             if not isinstance(val, str) or val not in allowed:
                 return False, "%s must be one of %s" % (key, list(allowed))
+        elif key in _TUNING_FLOAT_RANGES:
+            lo, hi = _TUNING_FLOAT_RANGES[key]
+            # JSON serializes 1 as int — coerce explicitly.
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return False, "%s must be a number" % key
+            fv = float(val)
+            if fv < lo or fv > hi:
+                return False, "%s out of range [%g, %g]" % (key, lo, hi)
         else:
             return False, "unknown key: %s" % key
     return True, ""
