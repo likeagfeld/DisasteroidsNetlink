@@ -296,8 +296,8 @@ def _render_admin_html() -> bytes:
       takes effect on the next match start.
     </p>
     <div class="tuning-presets">
-      <label><input type="radio" name="syncmode-{slug}" value="LERP"> LERP <span class="muted">(default, current)</span></label>
-      <label><input type="radio" name="syncmode-{slug}" value="RING"> RING <span class="muted">(Utenyaa-style)</span></label>
+      <label><input type="radio" name="syncmode-{slug}" value="RING"> RING <span class="muted">(default — Utenyaa-style snapshot ring + interp/extrap)</span></label>
+      <label><input type="radio" name="syncmode-{slug}" value="LERP"> LERP <span class="muted">(legacy — always-available revert)</span></label>
     </div>
     <div class="tuning-knobs" style="margin-top:8px">
       <label>
@@ -309,11 +309,6 @@ def _render_admin_html() -> bytes:
         Asteroid speed scale
         <input type="number" step="0.1" min="0.25" max="2.0" class="sync-asteroid-speed-scale" style="width:70px">
         <span class="muted">(1.0 = default, &lt;1.0 = slower asteroids, &gt;1.0 = faster — applies to new spawns)</span>
-      </label>
-      <label>
-        Ship collision radius bonus
-        <input type="number" step="1" min="-3" max="3" class="sync-ship-radius-bonus" style="width:70px">
-        <span class="muted">(0 = default, negative = stricter server-side ship-vs-asteroid hits — reduces ghost-kills)</span>
       </label>
     </div>
     <div class="controls" style="margin-top:10px">
@@ -737,8 +732,7 @@ function wireSyncInputs(slug){
   // user's edit. They live in the same panel because they're the three
   // server-side game-feel knobs added in v1.1.3.
   ['.sync-asteroid-correct',
-   '.sync-asteroid-speed-scale',
-   '.sync-ship-radius-bonus'].forEach(function(sel){
+   '.sync-asteroid-speed-scale'].forEach(function(sel){
     var el=$(sel,sp);
     if(!el)return;
     var mark=function(){syncDirty[slug]=true;
@@ -769,11 +763,6 @@ function renderSyncMode(slug,d){
       var sv=d.tuning.asteroid_speed_scale;
       ass.value = (sv===undefined) ? 1.0 : sv;
     }
-    var srb=$('.sync-ship-radius-bonus',sp);
-    if(srb){
-      var bv=d.tuning.ship_collision_radius_bonus;
-      srb.value = (bv===undefined) ? 0 : bv;
-    }
   }
   var badge=$('.sync-badge',sp);
   if(badge){
@@ -795,12 +784,6 @@ function applySyncMode(slug){
     var sv=parseFloat(ass.value);
     if(sv<0.25)sv=0.25; if(sv>2.0)sv=2.0;
     body.asteroid_speed_scale = sv;
-  }
-  var srb=$('.sync-ship-radius-bonus',sp);
-  if(srb && srb.value!=='' && !isNaN(parseInt(srb.value,10))){
-    var bv=parseInt(srb.value,10);
-    if(bv<-3)bv=-3; if(bv>3)bv=3;
-    body.ship_collision_radius_bonus = bv;
   }
   api('POST',slug,'tuning',body).then(function(r){
     if(r.error){showMsg('Sync error: '+r.error,'#d32f2f');return;}

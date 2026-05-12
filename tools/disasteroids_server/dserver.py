@@ -698,6 +698,18 @@ class GameSimulation:
             # PvP hit reports carrying a firer_frame can be compared
             # against the victim's authoritative pose at that moment.
             "history": collections.deque(maxlen=SERVER_SNAP_RING_DEPTH),
+            # v1.1.4 diag: timestamps of recent client-reported ship-asteroid
+            # hits, used to distinguish ghost kills (server fired with no
+            # corroborating client report) from legitimate hits.
+            "recent_hit_reports": collections.deque(maxlen=8),
+            # v1.1.4 diag: accumulated position-correction deltas since
+            # game start. Each entry is the L1 distance (in fxp) between
+            # server's predicted position at SHIP_STATE arrival and the
+            # actual position the client sent. Capped to keep memory bounded.
+            "pos_delta_samples": collections.deque(maxlen=1024),
+            "ship_state_arrivals": 0,
+            "ghost_kill_count": 0,
+            "kill_count": 0,
         }
 
     def update_player_pos(self, player_id: int, x: int, y: int,
@@ -931,6 +943,40 @@ class GameSimulation:
                     if ship_r < 1:
                         ship_r = 1
                     if _circle_collision(ax, ay, ar, px, py, ship_r):
+                        # v1.1.4 diag: server-initiated kill. Capture the
+                        # context so we can later distinguish honest hits
+                        # (client also reported it) from ghost kills (no
+                        # corroboration). Only logged when toggle is on
+                        # (default True). diag_kill_logging is on the
+                        # parent server's tuning, not the sim, so we use
+                        # a sim-local flag set by _game_tick().
+                        if getattr(self, "_diag_on", True):
+                            # L2 distance in pixels at the moment of kill.
+                            ddx = ax - px
+                            ddy = ay - py
+                            dist_sq = ddx * ddx + ddy * ddy
+                            # Check if the client reported a hit within
+                            # 500ms — if yes, this is a legitimate kill;
+                            # if no, this is a candidate ghost kill.
+                            now_ts = time.time()
+                            recent_hits = p.get("recent_hit_reports", ())
+                            corroborated = any(
+                                (now_ts - t) < 0.5 for t in recent_hits)
+                            kind = "HIT" if corroborated else "GHOST"
+                            log.info(
+                                "DIAG_KILL kind=%s pid=%d slot=%d "
+                                "ship=(%d,%d) asteroid=(%d,%d) "
+                                "dist_sq=%d r_ship=%d r_ast=%d "
+                                "dx_dy=(%d,%d) last_ship_state_delta_count=%d",
+                                kind, pid, i, px, py, ax, ay, dist_sq,
+                                ship_r, ar,
+                                int(_from_fixed(p["dx"])),
+                                int(_from_fixed(p["dy"])),
+                                len(p.get("pos_delta_samples", ())))
+                            if not corroborated:
+                                p["ghost_kill_count"] = \
+                                    p.get("ghost_kill_count", 0) + 1
+                            p["kill_count"] = p.get("kill_count", 0) + 1
                         kill_evt = self._kill_player(pid, i)
                         if kill_evt:
                             events.append(kill_evt)
@@ -1384,12 +1430,18 @@ class DisasteroidsServer:
             "asteroid_sync_correct": True,
             # v1.1.3 — server-side ship-vs-asteroid leniency. Server adds
             # this to PLAYER_SHIP_RADIUS (5) when checking collisions in
-            # tick(). Negative = stricter (server requires more overlap
-            # before killing), reducing "ghost kills" caused by the
-            # server's stale 4-frame-old player position. Positive =
-            # more aggressive (kills on near-misses). Range -3..+3
-            # enforced by validator. Default 0 = pre-1.1.3 behavior.
+            # tick(). Negative = stricter. Removed from admin UI in v1.1.4
+            # (was a bandaid for ghost kills; v1.1.4 ships diagnostic
+            # logging to collect data and ship a real fix in v1.2.0).
+            # Tuning entry kept for direct API access.
             "ship_collision_radius_bonus": 0,
+            # v1.1.4 — turn on by default. Writes DIAG_* lines to the
+            # systemd journal whenever a SHIP_STATE arrives (position
+            # delta), a kill fires (full context + whether the client
+            # corroborated it), or a game ends (per-player summary).
+            # Read-only — never affects gameplay. Disable via admin if
+            # you want quieter logs.
+            "diag_kill_logging": True,
             # v1.1.3 — game-feel: scale all new asteroid spawn velocities
             # by this factor. 1.0 = original speed; 0.5 = half-speed asteroids
             # (gentler, more time to react); 1.5 = harder. Only affects
@@ -2235,8 +2287,43 @@ class DisasteroidsServer:
             raw_data = payload[1:]
 
         if self.sim:
+            # v1.1.4 diag: capture position divergence BEFORE the
+            # incoming SHIP_STATE overwrites our tracked pose. p["x"]
+            # was advanced each tick from the previous SHIP_STATE's
+            # dx/dy — comparing it to the just-arrived (x, y) tells us
+            # how far the server's dead-reckoning drifted in the ~67 ms
+            # since the last update. This is the smoking gun for ghost
+            # kills: large delta → server was checking collisions at a
+            # position the Saturn no longer thought it was at.
+            if self.tuning.get("diag_kill_logging", True):
+                p = self.sim.players.get(player_id)
+                if p is not None and p.get("ship_state_arrivals", 0) > 0:
+                    delta_x = x - p["x"]
+                    delta_y = y - p["y"]
+                    # Convert to integer screen pixels (fxp -> int).
+                    dx_px = abs(int(_from_fixed(delta_x)))
+                    dy_px = abs(int(_from_fixed(delta_y)))
+                    delta_l1 = dx_px + dy_px
+                    p["pos_delta_samples"].append(delta_l1)
+                    # Only emit a log line for OUTLIERS so we don't spam.
+                    # 5 px L1 = noticeable, 10 px L1 = ghost-kill-grade.
+                    if delta_l1 >= 5:
+                        log.info(
+                            "DIAG_CORR pid=%d delta_px=(%d,%d) L1=%d "
+                            "predicted=(%d,%d) arrived=(%d,%d)",
+                            player_id, dx_px, dy_px, delta_l1,
+                            int(_from_fixed(p["x"])),
+                            int(_from_fixed(p["y"])),
+                            int(_from_fixed(x)),
+                            int(_from_fixed(y)))
             self.sim.update_player_pos(player_id, x, y, dx, dy, flags,
                                         server_frame=self._tick_counter)
+            # Bump arrival counter AFTER update (so the first call has
+            # arrivals==0 and we skip computing a delta against
+            # uninitialized state).
+            p2 = self.sim.players.get(player_id)
+            if p2 is not None:
+                p2["ship_state_arrivals"] = p2.get("ship_state_arrivals", 0) + 1
 
         # Apply tuning gates (decimate + skip_stationary w/ keepalive).
         # Defaults (PASSTHROUGH) make this block a no-op.
@@ -2321,6 +2408,15 @@ class DisasteroidsServer:
         slot = payload[1]
         player_id = payload[2]
 
+        # v1.1.4 diag: record this client-reported hit timestamp so that
+        # any server-side kill within ~500ms can be classified as
+        # corroborated (real) rather than a ghost kill. Only relevant
+        # for ship-asteroid hits (slot != 0xFF) on the sender's OWN ship.
+        if slot != 0xFF and self.sim:
+            target = self.sim.players.get(player_id)
+            if target is not None:
+                target["recent_hit_reports"].append(time.time())
+
         # Phase 4 hit-message v2: optional [firer_frame:2 BE] tail. Old
         # clients send 3-byte payload (no frame); new clients send 5-byte.
         # Server simply ignores the extra bytes if absent.
@@ -2403,6 +2499,11 @@ class DisasteroidsServer:
         speed_scale = float(self.tuning.get("asteroid_speed_scale", 1.0))
         ship_radius_bonus = int(
             self.tuning.get("ship_collision_radius_bonus", 0))
+        # Push the diag flag into the sim so the inner collision loop
+        # can decide whether to emit DIAG_KILL lines without round-trips
+        # to self.tuning.
+        self.sim._diag_on = bool(
+            self.tuning.get("diag_kill_logging", True))
         events = self.sim.tick(wrap_saturn=wrap_saturn,
                                 speed_scale=speed_scale,
                                 ship_radius_bonus=ship_radius_bonus)
@@ -2581,6 +2682,28 @@ class DisasteroidsServer:
             self._broadcast_to_game(msg)
             self.game_active = False
             log.info("Game over! Winner=%d", winner)
+            # v1.1.4 diag: one-line summary per player. Gives short-session
+            # play a single greppable record without having to scroll through
+            # every DIAG_CORR / DIAG_KILL line.
+            if self.tuning.get("diag_kill_logging", True) and self.sim:
+                for pid, p in self.sim.players.items():
+                    samples = list(p.get("pos_delta_samples", ()))
+                    n = len(samples)
+                    avg = sum(samples) // n if n > 0 else 0
+                    mx = max(samples) if n > 0 else 0
+                    # p95 — rough, no sort optimization needed at n ≤ 1024
+                    p95 = 0
+                    if n > 0:
+                        s = sorted(samples)
+                        p95 = s[max(0, int(n * 0.95) - 1)]
+                    log.info(
+                        "DIAG_SUMMARY pid=%d arrivals=%d "
+                        "pos_delta_px avg=%d p95=%d max=%d "
+                        "kills=%d ghost_kills=%d",
+                        pid, p.get("ship_state_arrivals", 0),
+                        avg, p95, mx,
+                        p.get("kill_count", 0),
+                        p.get("ghost_kill_count", 0))
             # Update leaderboard BEFORE resetting in_game flags,
             # because _update_leaderboard checks c.in_game to find participants
             self._update_leaderboard(winner)
@@ -2845,9 +2968,10 @@ class DisasteroidsServer:
         asteroid_correct_change = data.get("asteroid_sync_correct")
         asteroid_speed_scale_change = data.get("asteroid_speed_scale")
         ship_radius_bonus_change = data.get("ship_collision_radius_bonus")
+        diag_kill_logging_change = data.get("diag_kill_logging")
         ORTHOGONAL = {"preset", "sync_mode",
                        "asteroid_sync_correct", "asteroid_speed_scale",
-                       "ship_collision_radius_bonus"}
+                       "ship_collision_radius_bonus", "diag_kill_logging"}
         bandwidth_keys = [k for k in data.keys() if k not in ORTHOGONAL]
 
         if preset == "AUTO":
@@ -2881,6 +3005,11 @@ class DisasteroidsServer:
                     ship_radius_bonus_change)
                 log.info("Tuning: ship_collision_radius_bonus=%d",
                          int(ship_radius_bonus_change))
+            if diag_kill_logging_change is not None:
+                self.tuning["diag_kill_logging"] = bool(
+                    diag_kill_logging_change)
+                log.info("Tuning: diag_kill_logging=%s",
+                         diag_kill_logging_change)
             return
 
         if preset and preset != "CUSTOM":
@@ -2930,6 +3059,10 @@ class DisasteroidsServer:
                 ship_radius_bonus_change)
             log.info("Tuning: ship_collision_radius_bonus=%d",
                      int(ship_radius_bonus_change))
+
+        if diag_kill_logging_change is not None:
+            self.tuning["diag_kill_logging"] = bool(diag_kill_logging_change)
+            log.info("Tuning: diag_kill_logging=%s", diag_kill_logging_change)
 
     def _apply_tuning_preset(self, preset_name: str,
                              from_auto: bool = False) -> bool:
@@ -3125,7 +3258,8 @@ _TUNING_INT_RANGES = {
     "bot_sync_every_n_ticks":    (1, 4),
     "ship_collision_radius_bonus": (-3, 3),
 }
-_TUNING_BOOL_KEYS = {"ship_sync_skip_stationary", "asteroid_sync_correct"}
+_TUNING_BOOL_KEYS = {"ship_sync_skip_stationary", "asteroid_sync_correct",
+                     "diag_kill_logging"}
 _TUNING_STR_ENUMS = {
     "sync_mode": ("LERP", "RING"),
 }
